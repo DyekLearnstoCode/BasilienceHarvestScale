@@ -29,14 +29,18 @@ constexpr uint8_t LCD_COLS        = 16;
 constexpr uint8_t LCD_ROWS        = 2;
 
 // ------------------------------------------------------------
-// WIFI CREDENTIALS
+// WIFI PROVISIONING
 // ------------------------------------------------------------
 //
-// Replace with your actual WiFi network details.
+// SECURE WIFI PROVISIONING — no network name/password is compiled into
+// this firmware (the previous version hardcoded a real home-router
+// password directly into source under version control). NetworkManager
+// persists credentials to flash once entered and, on first boot or
+// whenever the saved network can't be reached, opens its own
+// "Basilience-Scale-Setup" access point with a setup form at
+// http://192.168.4.1/ — connect a phone/laptop to that network to
+// provision this scale. See NetworkManager.h/.cpp.
 //
-
-const char* WIFI_SSID     = "PochixFloydie";
-const char* WIFI_PASSWORD = "REDACTED-ROTATE-THIS-CREDENTIAL";
 
 // ------------------------------------------------------------
 // FIREBASE CREDENTIALS
@@ -44,13 +48,37 @@ const char* WIFI_PASSWORD = "REDACTED-ROTATE-THIS-CREDENTIAL";
 //
 // API Key:      Firebase Console > Project Settings > General
 // Database URL: Firebase Console > Realtime Database
-// DB Secret:    Project Settings > Service Accounts >
-//               Database Secrets
+//
+// SECURE DEVICE AUTH — this unit no longer uses the project-wide RTDB
+// "Database Secret" (that credential is a master key that bypasses
+// every security rule for the ENTIRE database, not just this device -
+// see FirebaseManager.h/.cpp). Instead it bootstraps its own scoped
+// identity, the same way the ESP32 firmware does:
+//
+//   1. Generate a strong random secret for THIS unit, e.g.:
+//        openssl rand -hex 32
+//   2. Register it server-side (required before this firmware can
+//      connect - the bootstrap Cloud Function rejects anything not
+//      provisioned):
+//        a. Pick a deviceId for this scale, e.g. "BSLN-SCALE-0001".
+//        b. RTDB: set /provisioning/{MAC-no-colons}/deviceToken to
+//           that deviceId (MAC as printed by WiFi.macAddress(), with
+//           the colons removed, e.g. AA:BB:CC:DD:EE:FF -> AABBCCDDEEFF).
+//        c. Firestore: create deviceCredentials/{deviceId} with
+//           secretHash = sha256(secret) as a lowercase hex string
+//           (never store the plaintext secret).
+//   3. Paste the same secret from step 1 below.
+//
+// On first boot the device exchanges this secret for a Firebase custom
+// token (uid = deviceId) via deviceAuthBootstrap and persists the
+// resulting refresh token to flash - this constant is only read once
+// per fresh flash/reflash, never sent anywhere after that first
+// exchange.
 //
 
 const char* FB_API_KEY      = "AIzaSyDaJ7F8tAREnCo7zrrY_sJ6SgfNuYQtra0";
 const char* FB_DATABASE_URL = "https://basilience-database-default-rtdb.asia-southeast1.firebasedatabase.app";
-const char* FB_DB_SECRET    = "REDACTED-ROTATE-THIS-CREDENTIAL";
+const char* HARVEST_SCALE_DEVICE_SECRET = "REDACTED-ROTATE-THIS-CREDENTIAL";
 // ------------------------------------------------------------
 // CALIBRATION
 // ------------------------------------------------------------
@@ -123,15 +151,12 @@ DisplayManager display(
     LCD_ROWS
 );
 
-NetworkManager network(
-    WIFI_SSID,
-    WIFI_PASSWORD
-);
+NetworkManager network;
 
 FirebaseManager firebase(
     FB_API_KEY,
     FB_DATABASE_URL,
-    FB_DB_SECRET
+    HARVEST_SCALE_DEVICE_SECRET
 );
 
 // ------------------------------------------------------------
@@ -139,7 +164,7 @@ FirebaseManager firebase(
 // ------------------------------------------------------------
 
 unsigned long lastReadingTime    = 0;
-unsigned long lastLiveUpdateTime = 0;   // Throttle Firebase /LoadCell updates
+unsigned long lastLiveUpdateTime = 0;   // Throttle Firebase liveWeight updates
 
 // Stability tracking
 float         stableReadings[STABLE_READINGS];
@@ -211,6 +236,14 @@ void warmUpScale()
     {
         yield();
 
+        // This 60-second wait runs right after WiFi setup, in the window
+        // someone is most likely to actually be trying to connect to the
+        // setup portal - without servicing it here too, the DNS/HTTP
+        // server would sit completely unanswered for the whole warm-up,
+        // not just delayed. Confirmed cause of "connects to the AP but no
+        // setup form ever appears."
+        network.update();
+
         long rawValue = 0;
 
         if (loadCell.readRawAverage(5, rawValue, HX711_TIMEOUT_MS))
@@ -239,6 +272,14 @@ void warmUpScale()
     }
 
     Serial.println("[SCALE] Warm-up complete.");
+}
+
+// Shown once, right before NetworkManager blocks on the setup portal -
+// NetworkManager has no display dependency of its own, so it invokes this
+// via a plain callback instead.
+void showWifiSetupModeOnDisplay()
+{
+    display.showError("Setup Mode", "Join: Basilience-Scale-Setup");
 }
 
 // ============================================================
@@ -271,12 +312,22 @@ void setup()
 
     if (!loadCell.begin(HX711_TIMEOUT_MS))
     {
-        Serial.println("[SCALE] ERROR: HX711 not detected.");
+        // Deliberately NOT a `return` - WiFi provisioning, Firebase
+        // connectivity, and the setup portal must all stay reachable even
+        // with the load cell unplugged or faulty (e.g. testing/bring-up
+        // without the full hardware assembled, or diagnosing a wiring
+        // fault remotely). loop()'s own weight-reading path already
+        // tolerates a HX711 read failure per-iteration without crashing -
+        // this unit will just never produce a real weight until the HX711
+        // is actually connected.
+        Serial.println("[SCALE] ERROR: HX711 not detected. Continuing without it - WiFi/Firebase setup still runs.");
         display.showError("HX711 ERROR!", "Check wiring");
-        return;
+        delay(1500);
     }
-
-    Serial.println("[SCALE] HX711 detected.");
+    else
+    {
+        Serial.println("[SCALE] HX711 detected.");
+    }
     loadCell.setCalibrationFactor(CALIBRATION_FACTOR);
 
     // --------------------------------------------------------
@@ -287,16 +338,25 @@ void setup()
 
     Serial.println();
     Serial.println("====================================");
-    Serial.print("[WIFI] SSID: ");
-    Serial.println(WIFI_SSID);
+    Serial.println("[WIFI] Loading saved credentials...");
     Serial.println("====================================");
 
-    bool wifiOk = network.connect();
+    // No saved network (or the saved one can't be reached) starts the
+    // Basilience-Scale-Setup portal instead, in the background - it does
+    // NOT block here. Weighing continues locally either way; only
+    // Firebase upload is unavailable until the portal is used (or a
+    // saved network is later reachable) and the device restarts.
+    bool wifiOk = network.connect(showWifiSetupModeOnDisplay);
 
     if (wifiOk)
     {
         display.showError("WiFi Connected!", network.getIPAddress());
         delay(1500);
+    }
+    else if (network.isProvisioning())
+    {
+        Serial.println("[WIFI] Setup portal active - scale continues in offline/local mode.");
+        delay(1500); // Let showWifiSetupModeOnDisplay()'s message stay readable briefly.
     }
     else
     {
@@ -346,14 +406,24 @@ void setup()
 
     if (!loadCell.tare(TARE_SAMPLES, HX711_TIMEOUT_MS))
     {
-        Serial.println("[SCALE] ERROR: Unable to tare.");
-        display.showError("Tare failed!", "Restart scale");
-        return;
+        // Deliberately NOT a `return` here either - see the matching
+        // comment on the HX711 begin() check above. Without this, a
+        // missing/failed HX711 would let setup() reach this point (WiFi/
+        // Firebase already started) and then dead-end here, before ever
+        // reaching loop() - meaning network.update() would stop being
+        // serviced entirely (only warmUpScale() drives it before loop()
+        // starts), silently killing the setup portal a full minute or so
+        // into every boot with a bad/absent load cell.
+        Serial.println("[SCALE] ERROR: Unable to tare. Continuing without it - WiFi/Firebase and the setup portal stay up.");
+        display.showError("Tare failed!", "Check HX711");
+        delay(1500);
     }
-
-    Serial.println("[SCALE] Tare complete.");
-    Serial.print("[SCALE] Tare offset: ");
-    Serial.println(loadCell.getOffset());
+    else
+    {
+        Serial.println("[SCALE] Tare complete.");
+        Serial.print("[SCALE] Tare offset: ");
+        Serial.println(loadCell.getOffset());
+    }
 
     Serial.println();
     Serial.println("====================================");
@@ -373,17 +443,28 @@ void setup()
 void loop()
 {
     // --------------------------------------------------------
+    // WIFI KEEPALIVE / SETUP PORTAL SERVICING
+    // --------------------------------------------------------
+    //
+    // Deliberately BEFORE the reading-interval gate below, and runs every
+    // single loop() iteration - not throttled to it. While the setup
+    // portal is active this drives _dnsServer.processNextRequest() and
+    // _server.handleClient(); gating it to the same 500ms weight-sampling
+    // cadence meant a captive-portal handshake (DNS query, then a
+    // separate TCP connect + HTTP GET) could sit unanswered for multiple
+    // ticks in a row - easily enough to blow past how impatient mobile
+    // OS captive-portal detection actually is. This was the confirmed
+    // cause of "connects to the AP but no setup form ever appears."
+    //
+
+    network.update();
+
+    // --------------------------------------------------------
     // READING INTERVAL
     // --------------------------------------------------------
 
     if (millis() - lastReadingTime < READING_INTERVAL_MS) { return; }
     lastReadingTime = millis();
-
-    // --------------------------------------------------------
-    // WIFI KEEPALIVE
-    // --------------------------------------------------------
-
-    network.reconnectIfNeeded();
 
     // --------------------------------------------------------
     // READ WEIGHT
@@ -471,7 +552,7 @@ void loop()
     display.showWeight(weightGrams, weightKg);
 
     // --------------------------------------------------------
-    // LIVE WEIGHT → RTDB /LoadCell  (every 5 seconds)
+    // LIVE WEIGHT → RTDB devices/{deviceId}/harvestScale/liveWeight  (every 5 seconds)
     // --------------------------------------------------------
     //
     // Throttled — Firebase SSL calls are slow on ESP8266.

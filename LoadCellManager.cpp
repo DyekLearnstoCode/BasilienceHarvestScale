@@ -23,17 +23,51 @@ bool LoadCellManager::begin(
     unsigned long timeoutMs
 )
 {
-    scale.begin(
-        doutPin,
-        sckPin
-    );
+    // Deliberately does NOT call scale.begin(doutPin, sckPin) yet. That
+    // library call ends by internally calling set_gain() -> read() ->
+    // wait_ready() - and that innermost wait_ready() has NO timeout of
+    // its own (a bare `while (!is_ready()) { delay(...); }`). With no
+    // HX711 physically connected, that blocks forever, before our own
+    // timeoutMs bound below ever gets a chance to run - confirmed root
+    // cause of setup() hanging indefinitely (no reset, no further serial
+    // output, ever) when testing without the sensor wired up.
+    //
+    // Fix: set up the pins ourselves and poll DOUT directly (not through
+    // `scale`, whose internal DOUT/PD_SCK members aren't set until
+    // begin() runs) with OUR OWN bounded wait. Only once the chip has
+    // actually signaled ready do we call scale.begin() - at that point
+    // its internal wait_ready() call finds is_ready() true immediately
+    // and returns at once instead of blocking.
+    pinMode(sckPin, OUTPUT);
+    pinMode(doutPin, INPUT);
+    digitalWrite(sckPin, LOW);
 
-    if (!waitUntilReady(timeoutMs)) {
+    unsigned long startTime = millis();
+    bool chipReady = false;
 
+    while (millis() - startTime < timeoutMs)
+    {
+        if (digitalRead(doutPin) == LOW)
+        {
+            chipReady = true;
+            break;
+        }
+
+        yield();
+        delay(1);
+    }
+
+    if (!chipReady)
+    {
         available = false;
 
         return false;
     }
+
+    scale.begin(
+        doutPin,
+        sckPin
+    );
 
     available = true;
 

@@ -1,9 +1,10 @@
+#include <LiquidCrystal_I2C.h>
+
 #ifndef DISPLAY_MANAGER_H
 #define DISPLAY_MANAGER_H
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 
 // ============================================================
 // DISPLAY MANAGER
