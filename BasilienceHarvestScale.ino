@@ -102,14 +102,46 @@ constexpr unsigned long READING_INTERVAL_MS = 500;
 // ------------------------------------------------------------
 // WARM-UP
 // ------------------------------------------------------------
-
-constexpr unsigned long WARMUP_TIME_MS = 60000;
+//
+// Lowered from 60s - that was a conservative round-number default, not a
+// value actually tuned to this specific load cell/HX711 pairing. 30s is
+// still a deliberate, cautious choice (this is a one-time boot-time cost,
+// paid every power-on) while cutting the wait roughly in half. If harvest
+// weighings taken shortly after boot ever look drifted compared to ones
+// taken later in the same session, that's a sign this needs to go back up
+// rather than lower still.
+//
+constexpr unsigned long WARMUP_TIME_MS = 30000;
 
 // ------------------------------------------------------------
 // ZERO DEADBAND
 // ------------------------------------------------------------
 
 constexpr float ZERO_DEADBAND_GRAMS = 5.0f;
+
+// ------------------------------------------------------------
+// DISPLAY SMOOTHING
+// ------------------------------------------------------------
+//
+// get_units(READING_SAMPLES) already averages within one reading, but
+// nothing smooths ACROSS the 500ms reading cycles - every loop() computed
+// a fresh, independent average and printed it immediately, so ordinary
+// HX711 noise (a few grams, normal for a DIY load cell without extra
+// shielding) showed up on the LCD as constant decimal jitter with nothing
+// ever looking "settled," even though the underlying upload-stability
+// logic below was working correctly the whole time on the same raw
+// readings. This is a simple exponential moving average applied ONLY to
+// what's shown on screen - the upload-stability check further below
+// deliberately keeps using the raw, unsmoothed weightGrams, since that
+// decision needs to see genuine reading-to-reading agreement, not a
+// filtered value that could mask real instability.
+//
+// 0.25 reaches ~90% of a real step change (an item actually placed/
+// removed) within about 4 update cycles (~2 seconds) while still damping
+// single-cycle noise significantly - responsive enough to feel live,
+// smooth enough to stop the flicker.
+//
+constexpr float DISPLAY_SMOOTHING_ALPHA = 0.25f;
 
 // ------------------------------------------------------------
 // SCALE CAPACITY
@@ -166,6 +198,11 @@ FirebaseManager firebase(
 unsigned long lastReadingTime    = 0;
 unsigned long lastLiveUpdateTime = 0;   // Throttle Firebase liveWeight updates
 
+// Display-only smoothed weight (see DISPLAY_SMOOTHING_ALPHA) - kept
+// entirely separate from the raw weightGrams the stability/upload logic
+// below evaluates every cycle.
+float displayWeightGrams = 0.0f;
+
 // Stability tracking
 float         stableReadings[STABLE_READINGS];
 uint8_t       stableIndex      = 0;
@@ -185,6 +222,11 @@ void resetStabilityBuffer(float value = 0.0f)
     {
         stableReadings[i] = value;
     }
+
+    // Snaps the displayed weight to match immediately rather than letting
+    // it EMA-decay back down over several cycles - a real tare or "load
+    // removed" event should read 0 g right away, not drift toward it.
+    displayWeightGrams = value;
 
     stableIndex     = 0;
     bufferFull      = false;
@@ -236,7 +278,7 @@ void warmUpScale()
     {
         yield();
 
-        // This 60-second wait runs right after WiFi setup, in the window
+        // This warm-up wait runs right after WiFi setup, in the window
         // someone is most likely to actually be trying to connect to the
         // setup portal - without servicing it here too, the DNS/HTTP
         // server would sit completely unanswered for the whole warm-up,
@@ -548,8 +590,15 @@ void loop()
     // --------------------------------------------------------
     // LCD OUTPUT
     // --------------------------------------------------------
+    //
+    // Smoothed across cycles (see DISPLAY_SMOOTHING_ALPHA) so the number on
+    // screen settles instead of flickering with ordinary HX711 noise - the
+    // upload-stability logic below still evaluates the raw weightGrams
+    // directly, unaffected by this.
+    //
 
-    display.showWeight(weightGrams, weightKg);
+    displayWeightGrams += (weightGrams - displayWeightGrams) * DISPLAY_SMOOTHING_ALPHA;
+    display.showWeight(displayWeightGrams, displayWeightGrams / 1000.0f);
 
     // --------------------------------------------------------
     // LIVE WEIGHT → RTDB devices/{deviceId}/harvestScale/liveWeight  (every 5 seconds)

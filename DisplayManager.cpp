@@ -22,7 +22,11 @@ void DisplayManager::showBoot() { if (!_available) return; _lcd.clear(); printCe
 void DisplayManager::showWarmUp(unsigned long s) { if (!_available) return; printPadded(0, "Warming up..."); String r = "Wait: "; r += s; r += " sec"; printPadded(1, r); }
 void DisplayManager::showTaring() { if (!_available) return; _lcd.clear(); printCentered(0, "Taring..."); printCentered(1, "Keep empty!"); }
 void DisplayManager::showReady() { if (!_available) return; _lcd.clear(); printCentered(0, "Scale Ready!"); printCentered(1, "Place item..."); }
-void DisplayManager::showWeight(float g, float kg) { if (!_available) return; String r0 = String(g,1)+" g"; printPadded(0,r0); String r1=String(kg,3)+" kg"; printPadded(1,r1); }
+// Grams shown as a whole number, not 1 decimal place - 0.1g resolution is
+// more precision than this DIY load cell setup can actually hold steady,
+// and was the most visible source of on-screen jitter (see the caller's
+// display-smoothing comment for the other half of that fix).
+void DisplayManager::showWeight(float g, float kg) { if (!_available) return; String r0 = String(g,0)+" g"; printPadded(0,r0); String r1=String(kg,3)+" kg"; printPadded(1,r1); }
 void DisplayManager::showError(const String& l1, const String& l2) { if (!_available) return; printPadded(0,l1); printPadded(1,l2); }
 void DisplayManager::backlightOn()  { if (_available) _lcd.backlight(); }
 void DisplayManager::backlightOff() { if (_available) _lcd.noBacklight(); }
