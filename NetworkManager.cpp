@@ -9,6 +9,21 @@ namespace
 const char* WIFI_SSID_FILE     = "/wifi_ssid.txt";
 const char* WIFI_PASSWORD_FILE = "/wifi_password.txt";
 
+// 802.11 hard limit (SSID) and WPA2-Personal's own valid passphrase range
+// (RSN, IEEE 802.11-2016 sec. 9.4.2.2 / 12.7.2) - not arbitrary choices.
+// Enforced server-side, not just as an HTML maxlength hint, since a raw
+// POST to /setup bypasses the form entirely: an unbounded string here
+// gets read fully into heap by the web server before any of our own code
+// runs, on a chip with only ~40-50KB of it free once WiFi + the portal's
+// own DNS/HTTP servers are resident - the practical concern isn't that a
+// garbage SSID does anything dangerous once stored (WiFi.begin() just
+// fails to associate with it, and it's never echoed into any HTML this
+// device serves), it's that an oversized one is a cheap way to crash the
+// device via heap exhaustion.
+constexpr size_t MAX_SSID_LEN         = 32;
+constexpr size_t MIN_WPA2_PASSWORD_LEN = 8;
+constexpr size_t MAX_PASSWORD_LEN      = 63;
+
 String readTextFile(const char* path)
 {
     if (!LittleFS.exists(path)) { return ""; }
@@ -259,6 +274,25 @@ void NetworkManager::setupAPServer()
         String newSsid = _server.arg("ssid");
         String newPassword = _server.hasArg("password") ? _server.arg("password") : "";
 
+        if (newSsid.length() > MAX_SSID_LEN)
+        {
+            Serial.println("[AP HTTP] Rejected: SSID too long");
+            _server.send(400, "text/plain", "SSID must be 32 characters or fewer");
+            return;
+        }
+
+        // An empty password means "open network" and is valid; anything
+        // else must fall inside WPA2-Personal's own passphrase range - a
+        // too-short value isn't a password anyone actually meant to set,
+        // and WiFi.begin() would just fail to associate with it anyway.
+        if (newPassword.length() > 0 &&
+            (newPassword.length() < MIN_WPA2_PASSWORD_LEN || newPassword.length() > MAX_PASSWORD_LEN))
+        {
+            Serial.println("[AP HTTP] Rejected: password out of range");
+            _server.send(400, "text/plain", "Password must be 8-63 characters, or blank for an open network");
+            return;
+        }
+
         Serial.print("[AP HTTP] SSID received: ");
         Serial.println(newSsid);
 
@@ -359,9 +393,9 @@ String NetworkManager::buildSetupFormHtml() const
         "<p class=\"sub\">Enter the Wi-Fi network this scale should join.</p>"
         "<form method=\"POST\" action=\"/setup\">"
         "<label for=\"ssid\">Network name (SSID)</label>"
-        "<input id=\"ssid\" name=\"ssid\" type=\"text\" autocapitalize=\"off\" autocorrect=\"off\" required>"
+        "<input id=\"ssid\" name=\"ssid\" type=\"text\" maxlength=\"32\" autocapitalize=\"off\" autocorrect=\"off\" required>"
         "<label for=\"password\">Password</label>"
-        "<input id=\"password\" name=\"password\" type=\"password\">"
+        "<input id=\"password\" name=\"password\" type=\"password\" maxlength=\"63\">"
         "<button type=\"submit\">Connect</button>"
         "</form>"
         "<div class=\"hint\">The scale keeps weighing locally while you set this up.</div>";
