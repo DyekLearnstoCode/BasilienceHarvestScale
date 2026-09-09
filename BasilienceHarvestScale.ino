@@ -201,6 +201,7 @@ bool          bufferFull       = false;
 unsigned long stableStartTime  = 0;
 bool          isStable         = false;
 bool          uploadedThisLoad = false;   // Prevent duplicate uploads
+float         lastUploadedWeightGrams = 0.0f;   // What the confirmed liveWeight/harvest entry was for
 
 // ============================================================
 // HELPERS
@@ -218,6 +219,25 @@ void resetStabilityBuffer(float value = 0.0f)
     // it EMA-decay back down over several cycles - a real tare or "load
     // removed" event should read 0 g right away, not drift toward it.
     displayWeightGrams = value;
+
+    stableIndex     = 0;
+    bufferFull      = false;
+    stableStartTime = 0;
+    isStable        = false;
+}
+
+// Re-open stability tracking for a NEW total that's still resting on the
+// platform (more was added on top of an already-confirmed load, rather
+// than the platform being emptied) - unlike resetStabilityBuffer() above,
+// this must NOT snap displayWeightGrams to any fixed value, since the
+// object never left the platform and the real weight right now is
+// whatever the next reading actually comes back as.
+void restartStabilityTracking()
+{
+    for (uint8_t i = 0; i < STABLE_READINGS; i++)
+    {
+        stableReadings[i] = 0.0f;
+    }
 
     stableIndex     = 0;
     bufferFull      = false;
@@ -563,9 +583,31 @@ void loop()
         if (uploadedThisLoad)
         {
             Serial.println("[SCALE] Load removed. Ready for next.");
-            uploadedThisLoad = false;
+            uploadedThisLoad        = false;
+            lastUploadedWeightGrams = 0.0f;
             resetStabilityBuffer(0.0f);
         }
+    }
+
+    // --------------------------------------------------------
+    // RESTACK DETECTION (weight added without a full clear)
+    // --------------------------------------------------------
+    //
+    // The reset above only fires once the platform empties - so weight
+    // piled on TOP of an already-confirmed load would otherwise never
+    // re-enter the stability/upload logic below, and the increase would
+    // never get logged or reach liveWeight (frozen once locked, below).
+    // Meaningfully more than what was last confirmed (same threshold the
+    // stability check itself uses for "is this actually different, or
+    // just noise") is treated the same as a fresh load: re-open tracking
+    // for the NEW total rather than requiring a full clear-and-reload.
+    //
+
+    if (uploadedThisLoad && weightGrams > lastUploadedWeightGrams + STABLE_THRESHOLD_GRAMS)
+    {
+        Serial.println("[SCALE] Additional weight detected on top of confirmed load - re-evaluating.");
+        uploadedThisLoad = false;
+        restartStabilityTracking();
     }
 
     // --------------------------------------------------------
@@ -604,8 +646,17 @@ void loop()
     // Throttled — Firebase SSL calls are slow on ESP8266.
     // Calling every 500ms would flood the board and cause crashes.
     //
+    // Frozen at the confirmed value once a load is locked in
+    // (uploadedThisLoad) instead of continuing to overwrite it with
+    // ordinary raw-reading noise - the harvests/ entry is the source of
+    // truth once logged, so a live number that keeps wiggling next to an
+    // already-confirmed one reads as contradictory. Restack detection
+    // above re-opens this the instant enough extra weight is added to be
+    // a real new total rather than noise.
+    //
 
     if (firebase.isReady() &&
+        !uploadedThisLoad &&
         millis() - lastLiveUpdateTime >= 5000)
     {
         lastLiveUpdateTime = millis();
@@ -632,7 +683,12 @@ void loop()
             {
                 Serial.println("[SCALE] Stable confirmed. Uploading...");
 
-                display.showError("Uploading...", String(weightGrams, 1) + " g");
+                // Same smoothed, whole-gram value the normal weighing screen
+                // shows (see displayWeightGrams above) - using the raw
+                // weightGrams here instead made the LCD visibly jump between
+                // this screen and the normal one even with a perfectly still
+                // object, since the two used different precision/smoothing.
+                display.showError("Uploading...", String(displayWeightGrams, 0) + " g");
 
                 if (firebase.isReady())
                 {
@@ -641,11 +697,12 @@ void loop()
 
                     if (uploaded)
                     {
-                        uploadedThisLoad = true;
-                        isStable         = false;
+                        uploadedThisLoad        = true;
+                        isStable                = false;
+                        lastUploadedWeightGrams = weightGrams;
 
                         Serial.println("[SCALE] Upload SUCCESS.");
-                        display.showError("Uploaded! OK", String(weightGrams, 1) + " g");
+                        display.showError("Uploaded! OK", String(displayWeightGrams, 0) + " g");
                         delay(1500);
                     }
                     else
@@ -658,8 +715,9 @@ void loop()
                 else
                 {
                     Serial.println("[SCALE] Firebase not ready — skipping upload.");
-                    uploadedThisLoad = true;   // Skip, don't retry forever
-                    isStable         = false;
+                    uploadedThisLoad        = true;   // Skip, don't retry forever
+                    isStable                = false;
+                    lastUploadedWeightGrams = weightGrams;
                 }
             }
         }
