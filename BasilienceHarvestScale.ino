@@ -2,6 +2,7 @@
 #include "DisplayManager.h"
 #include "NetworkManager.h"
 #include "FirebaseManager.h"
+#include "Secrets.h"
 
 // ============================================================
 // BASILIENCE HARVEST SCALE
@@ -46,39 +47,22 @@ constexpr uint8_t LCD_ROWS        = 2;
 // FIREBASE CREDENTIALS
 // ------------------------------------------------------------
 //
-// API Key:      Firebase Console > Project Settings > General
-// Database URL: Firebase Console > Realtime Database
+// FB_API_KEY, FB_DATABASE_URL and HARVEST_SCALE_DEVICE_SECRET are no
+// longer compiled in here — they live in "Secrets.h", a gitignored file
+// in this same sketch folder that is never committed. Copy
+// Secrets.h.example to Secrets.h and fill in real values there; see
+// that file for full setup instructions (bootstrap secret generation,
+// server-side registration, etc).
 //
-// SECURE DEVICE AUTH — this unit no longer uses the project-wide RTDB
+// SECURE DEVICE AUTH — this unit does not use the project-wide RTDB
 // "Database Secret" (that credential is a master key that bypasses
 // every security rule for the ENTIRE database, not just this device -
 // see FirebaseManager.h/.cpp). Instead it bootstraps its own scoped
-// identity, the same way the ESP32 firmware does:
+// identity, the same way the ESP32 firmware does: it exchanges its
+// per-device HARVEST_SCALE_DEVICE_SECRET for a Firebase custom token
+// (uid = deviceId) via deviceAuthBootstrap on first boot, and persists
+// the resulting refresh token to flash from then on.
 //
-//   1. Generate a strong random secret for THIS unit, e.g.:
-//        openssl rand -hex 32
-//   2. Register it server-side (required before this firmware can
-//      connect - the bootstrap Cloud Function rejects anything not
-//      provisioned):
-//        a. Pick a deviceId for this scale, e.g. "BSLN-SCALE-0001".
-//        b. RTDB: set /provisioning/{MAC-no-colons}/deviceToken to
-//           that deviceId (MAC as printed by WiFi.macAddress(), with
-//           the colons removed, e.g. AA:BB:CC:DD:EE:FF -> AABBCCDDEEFF).
-//        c. Firestore: create deviceCredentials/{deviceId} with
-//           secretHash = sha256(secret) as a lowercase hex string
-//           (never store the plaintext secret).
-//   3. Paste the same secret from step 1 below.
-//
-// On first boot the device exchanges this secret for a Firebase custom
-// token (uid = deviceId) via deviceAuthBootstrap and persists the
-// resulting refresh token to flash - this constant is only read once
-// per fresh flash/reflash, never sent anywhere after that first
-// exchange.
-//
-
-const char* FB_API_KEY      = "AIzaSyDaJ7F8tAREnCo7zrrY_sJ6SgfNuYQtra0";
-const char* FB_DATABASE_URL = "https://basilience-database-default-rtdb.asia-southeast1.firebasedatabase.app";
-const char* HARVEST_SCALE_DEVICE_SECRET = "REDACTED-ROTATE-THIS-CREDENTIAL";
 // ------------------------------------------------------------
 // CALIBRATION
 // ------------------------------------------------------------
@@ -89,6 +73,13 @@ const char* HARVEST_SCALE_DEVICE_SECRET = "REDACTED-ROTATE-THIS-CREDENTIAL";
 //
 
 constexpr float CALIBRATION_FACTOR = 124.64f;
+
+// The empty weighing platform/tray itself weighs ~50 g and is not zeroed
+// out by the boot-time tare, so every raw reading carries that fixed
+// offset on top of whatever is actually placed on it. Subtracted in
+// loop() right after each read so downstream logic (deadband, overload
+// check, stability, upload) all sees only the item's actual weight.
+constexpr float PLATFORM_TARE_GRAMS = 50.0f;
 
 // ------------------------------------------------------------
 // SCALE SETTINGS
@@ -520,6 +511,12 @@ void loop()
         display.showError("Read timeout!", "Check HX711");
         return;
     }
+
+    // --------------------------------------------------------
+    // PLATFORM TARE
+    // --------------------------------------------------------
+
+    weightGrams -= PLATFORM_TARE_GRAMS;
 
     // --------------------------------------------------------
     // ZERO DEADBAND

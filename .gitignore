@@ -1,0 +1,3 @@
+# Per-device Firebase/API credentials — never commit real values.
+# Copy Secrets.h.example to Secrets.h and fill in the real ones locally.
+Secrets.h
