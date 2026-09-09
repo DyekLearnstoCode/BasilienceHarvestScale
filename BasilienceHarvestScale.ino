@@ -590,22 +590,24 @@ void loop()
     }
 
     // --------------------------------------------------------
-    // RESTACK DETECTION (weight added without a full clear)
+    // RESTACK DETECTION (weight changed without a full clear)
     // --------------------------------------------------------
     //
     // The reset above only fires once the platform empties - so weight
-    // piled on TOP of an already-confirmed load would otherwise never
-    // re-enter the stability/upload logic below, and the increase would
+    // added on TOP of an already-confirmed load, or partially taken back
+    // off without dropping below UPLOAD_MIN_GRAMS, would otherwise never
+    // re-enter the stability/upload logic below, and the new total would
     // never get logged or reach liveWeight (frozen once locked, below).
-    // Meaningfully more than what was last confirmed (same threshold the
-    // stability check itself uses for "is this actually different, or
-    // just noise") is treated the same as a fresh load: re-open tracking
-    // for the NEW total rather than requiring a full clear-and-reload.
+    // Meaningfully different from what was last confirmed in EITHER
+    // direction (same threshold the stability check itself uses for "is
+    // this actually different, or just noise") is treated the same as a
+    // fresh load: re-open tracking for the NEW total rather than
+    // requiring a full clear-and-reload.
     //
 
-    if (uploadedThisLoad && weightGrams > lastUploadedWeightGrams + STABLE_THRESHOLD_GRAMS)
+    if (uploadedThisLoad && fabsf(weightGrams - lastUploadedWeightGrams) > STABLE_THRESHOLD_GRAMS)
     {
-        Serial.println("[SCALE] Additional weight detected on top of confirmed load - re-evaluating.");
+        Serial.println("[SCALE] Weight changed on the platform - re-evaluating.");
         uploadedThisLoad = false;
         restartStabilityTracking();
     }

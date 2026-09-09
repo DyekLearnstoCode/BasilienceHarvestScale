@@ -38,7 +38,9 @@ The firmware does not upload every reading. It waits until it is confident someo
 
 Once all three conditions are met, the firmware uploads the weight once and sets an `uploadedThisLoad` flag so it will not upload again for the same item, even if the reading keeps sitting there stable.
 
-**Resetting after removal.** The upload flag and the stability buffer only reset once the weight drops back below the 50 gram minimum threshold, meaning the item has actually been taken off the platform. At that point the scale is ready to detect and upload the next item.
+**Resetting after removal.** The upload flag and the stability buffer reset once the weight drops back below the 50 gram minimum threshold, meaning the item has actually been taken off the platform. At that point the scale is ready to detect and upload the next item.
+
+**Resetting after a change without full removal.** The platform doesn't have to be fully emptied for the scale to notice something changed. If the weight moves more than 10 grams (`STABLE_THRESHOLD_GRAMS`) away from what was last confirmed — in either direction, so this covers both adding more on top of an already-logged item and partially taking some back off, as long as it doesn't drop below the 50 gram floor — the scale treats it as a new total: it re-opens the stability/hold check for that new total and logs a separate entry once it settles again, without needing the tray cleared and reloaded from scratch first. `liveWeight` (see section 5) follows the same logic: it freezes at the confirmed value once a load is locked in, and unfreezes the moment this re-open happens.
 
 ## 4. Wi-Fi setup
 
@@ -60,7 +62,7 @@ Because this whole process relies on validating a security certificate, and the 
 
 Once connected, two kinds of data go up:
 
-- **Live weight.** The current weight is written to `devices/{deviceId}/harvestScale/liveWeight` every 5 seconds. This just overwrites the same single value each time, so it does not pile up records. It is throttled to once every 5 seconds (rather than every 500ms reading) because Firebase network calls are slow on this chip, and calling them that often would overload it and can cause crashes.
+- **Live weight.** The current weight is written to `devices/{deviceId}/harvestScale/liveWeight` every 5 seconds. This just overwrites the same single value each time, so it does not pile up records. It is throttled to once every 5 seconds (rather than every 500ms reading) because Firebase network calls are slow on this chip, and calling them that often would overload it and can cause crashes. It stops updating (freezes at whatever it last showed) once a load has been confirmed and logged, so it doesn't keep wiggling with ordinary sensor noise next to a number that's already been finalized — see the "resetting after a change without full removal" note in section 3 for when it starts updating again.
 - **Confirmed harvest weight.** When the stability and hold-time checks described in section 3 confirm a final reading, a new record is added under `devices/{deviceId}/harvestScale/harvests/` containing the weight in grams, the weight in kilograms, and a timestamp (milliseconds since the device booted, not a real-world date, since the device has no persistent clock backing that). This only happens once per item.
 
 ## 6. How this scale is tied to one grow-chamber device
