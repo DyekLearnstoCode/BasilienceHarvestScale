@@ -206,6 +206,13 @@ long LoadCellManager::getOffset()
     return scale.get_offset();
 }
 
+void LoadCellManager::setOffset(
+    long offset
+)
+{
+    scale.set_offset(offset);
+}
+
 // ============================================================
 // CALIBRATION
 // ============================================================

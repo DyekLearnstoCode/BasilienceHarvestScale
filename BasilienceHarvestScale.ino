@@ -74,11 +74,18 @@ constexpr uint8_t LCD_ROWS        = 2;
 
 constexpr float CALIBRATION_FACTOR = 124.64f;
 
-// The empty weighing platform/tray itself weighs ~50 g and is not zeroed
-// out by the boot-time tare, so every raw reading carries that fixed
-// offset on top of whatever is actually placed on it. Subtracted in
-// loop() right after each read so downstream logic (deadband, overload
-// check, stability, upload) all sees only the item's actual weight.
+// The empty weighing platform/tray itself weighs ~50 g. "Platform must be
+// EMPTY. Taring..." below means the bare load cell with no tray on it -
+// the tray goes on AFTER tare, so scale.tare() never sees its weight and
+// can't zero it out on its own. This is folded into the tare offset itself
+// exactly once, right after tare() succeeds in setup() (see there) -
+// previously this was subtracted from every single reading in loop()
+// instead, which silently double-counted it any time the tray happened to
+// already be sitting on the load cell during tare (its weight already
+// zeroed out by tare() at that point): every reading then sat at a
+// constant -50 g on an otherwise empty platform. Applying it once, baked
+// into the offset, means it only ever fires for the documented "tray added
+// after tare" procedure.
 constexpr float PLATFORM_TARE_GRAMS = 50.0f;
 
 // ------------------------------------------------------------
@@ -109,30 +116,6 @@ constexpr unsigned long WARMUP_TIME_MS = 30000;
 // ------------------------------------------------------------
 
 constexpr float ZERO_DEADBAND_GRAMS = 5.0f;
-
-// ------------------------------------------------------------
-// DISPLAY SMOOTHING
-// ------------------------------------------------------------
-//
-// get_units(READING_SAMPLES) already averages within one reading, but
-// nothing smooths ACROSS the 500ms reading cycles - every loop() computed
-// a fresh, independent average and printed it immediately, so ordinary
-// HX711 noise (a few grams, normal for a DIY load cell without extra
-// shielding) showed up on the LCD as constant decimal jitter with nothing
-// ever looking "settled," even though the underlying upload-stability
-// logic below was working correctly the whole time on the same raw
-// readings. This is a simple exponential moving average applied ONLY to
-// what's shown on screen - the upload-stability check further below
-// deliberately keeps using the raw, unsmoothed weightGrams, since that
-// decision needs to see genuine reading-to-reading agreement, not a
-// filtered value that could mask real instability.
-//
-// 0.25 reaches ~90% of a real step change (an item actually placed/
-// removed) within about 4 update cycles (~2 seconds) while still damping
-// single-cycle noise significantly - responsive enough to feel live,
-// smooth enough to stop the flicker.
-//
-constexpr float DISPLAY_SMOOTHING_ALPHA = 0.25f;
 
 // ------------------------------------------------------------
 // SCALE CAPACITY
@@ -189,9 +172,12 @@ FirebaseManager firebase(
 unsigned long lastReadingTime    = 0;
 unsigned long lastLiveUpdateTime = 0;   // Throttle Firebase liveWeight updates
 
-// Display-only smoothed weight (see DISPLAY_SMOOTHING_ALPHA) - kept
-// entirely separate from the raw weightGrams the stability/upload logic
-// below evaluates every cycle.
+// What's actually shown on the LCD - a plain copy of the raw weightGrams,
+// updated only while no confirmed load is holding the screen frozen (see
+// the LCD OUTPUT block in loop()). Kept as its own variable (rather than
+// reading weightGrams directly at display time) so the "Uploading..."/
+// "Saved:" messages can show the exact same number the weighing screen
+// last displayed, and so it still holds that value while frozen.
 float displayWeightGrams = 0.0f;
 
 // Stability tracking
@@ -215,9 +201,8 @@ void resetStabilityBuffer(float value = 0.0f)
         stableReadings[i] = value;
     }
 
-    // Snaps the displayed weight to match immediately rather than letting
-    // it EMA-decay back down over several cycles - a real tare or "load
-    // removed" event should read 0 g right away, not drift toward it.
+    // Snaps the displayed weight to match immediately - a real tare or
+    // "load removed" event should read 0 g right away.
     displayWeightGrams = value;
 
     stableIndex     = 0;
@@ -474,6 +459,13 @@ void setup()
     else
     {
         Serial.println("[SCALE] Tare complete.");
+
+        // Fold the tray's weight into the tare offset itself, once, here -
+        // see the comment on PLATFORM_TARE_GRAMS above for why this must
+        // not also be re-applied per-loop.
+        long platformOffsetCounts = (long)(PLATFORM_TARE_GRAMS * CALIBRATION_FACTOR + 0.5f);
+        loadCell.setOffset(loadCell.getOffset() + platformOffsetCounts);
+
         Serial.print("[SCALE] Tare offset: ");
         Serial.println(loadCell.getOffset());
     }
@@ -531,12 +523,6 @@ void loop()
         display.showError("Read timeout!", "Check HX711");
         return;
     }
-
-    // --------------------------------------------------------
-    // PLATFORM TARE
-    // --------------------------------------------------------
-
-    weightGrams -= PLATFORM_TARE_GRAMS;
 
     // --------------------------------------------------------
     // ZERO DEADBAND
@@ -632,14 +618,23 @@ void loop()
     // LCD OUTPUT
     // --------------------------------------------------------
     //
-    // Smoothed across cycles (see DISPLAY_SMOOTHING_ALPHA) so the number on
-    // screen settles instead of flickering with ordinary HX711 noise - the
-    // upload-stability logic below still evaluates the raw weightGrams
-    // directly, unaffected by this.
+    // Shows the raw reading directly - get_units(READING_SAMPLES) already
+    // averages within one reading, and easing toward each new value across
+    // cycles (as this used to do) made placing an object look like the
+    // display was "counting" up to it instead of just showing the weight.
+    //
+    // Skipped entirely once a load is confirmed/uploaded (uploadedThisLoad)
+    // so the screen stays on the "Saved: ..." message and keeps matching
+    // what was actually written to Firebase, instead of drifting with
+    // ordinary noise on a physically unchanged load. Restack detection
+    // above re-enables this the moment the weight genuinely changes.
     //
 
-    displayWeightGrams += (weightGrams - displayWeightGrams) * DISPLAY_SMOOTHING_ALPHA;
-    display.showWeight(displayWeightGrams, displayWeightGrams / 1000.0f);
+    if (!uploadedThisLoad)
+    {
+        displayWeightGrams = weightGrams;
+        display.showWeight(displayWeightGrams, displayWeightGrams / 1000.0f);
+    }
 
     // --------------------------------------------------------
     // LIVE WEIGHT → RTDB devices/{deviceId}/harvestScale/liveWeight  (every 5 seconds)
@@ -685,11 +680,8 @@ void loop()
             {
                 Serial.println("[SCALE] Stable confirmed. Uploading...");
 
-                // Same smoothed, whole-gram value the normal weighing screen
-                // shows (see displayWeightGrams above) - using the raw
-                // weightGrams here instead made the LCD visibly jump between
-                // this screen and the normal one even with a perfectly still
-                // object, since the two used different precision/smoothing.
+                // Same whole-gram value the normal weighing screen just
+                // showed this same cycle (see displayWeightGrams above).
                 display.showError("Uploading...", String(displayWeightGrams, 0) + " g");
 
                 if (firebase.isReady())
@@ -704,7 +696,7 @@ void loop()
                         lastUploadedWeightGrams = weightGrams;
 
                         Serial.println("[SCALE] Upload SUCCESS.");
-                        display.showError("Uploaded! OK", String(displayWeightGrams, 0) + " g");
+                        display.showError("Saved:", String(displayWeightGrams, 0) + " g");
                         delay(1500);
                     }
                     else
