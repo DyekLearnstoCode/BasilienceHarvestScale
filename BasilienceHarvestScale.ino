@@ -201,10 +201,6 @@ void resetStabilityBuffer(float value = 0.0f)
         stableReadings[i] = value;
     }
 
-    // Snaps the displayed weight to match immediately - a real tare or
-    // "load removed" event should read 0 g right away.
-    displayWeightGrams = value;
-
     stableIndex     = 0;
     bufferFull      = false;
     stableStartTime = 0;
