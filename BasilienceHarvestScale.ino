@@ -67,26 +67,12 @@ constexpr uint8_t LCD_ROWS        = 2;
 // CALIBRATION
 // ------------------------------------------------------------
 //
-// Previous factor: 128.17
-// Refined factor:  124.64
-// (Known 196 g → measured 190.6 g)
+// Previous factor: 110.98
+// Refined factor:  110.54
+// (Known 250 g [250 mL water] → measured 249 g)
 //
 
-constexpr float CALIBRATION_FACTOR = 124.64f;
-
-// The empty weighing platform/tray itself weighs ~50 g. "Platform must be
-// EMPTY. Taring..." below means the bare load cell with no tray on it -
-// the tray goes on AFTER tare, so scale.tare() never sees its weight and
-// can't zero it out on its own. This is folded into the tare offset itself
-// exactly once, right after tare() succeeds in setup() (see there) -
-// previously this was subtracted from every single reading in loop()
-// instead, which silently double-counted it any time the tray happened to
-// already be sitting on the load cell during tare (its weight already
-// zeroed out by tare() at that point): every reading then sat at a
-// constant -50 g on an otherwise empty platform. Applying it once, baked
-// into the offset, means it only ever fires for the documented "tray added
-// after tare" procedure.
-constexpr float PLATFORM_TARE_GRAMS = 50.0f;
+constexpr float CALIBRATION_FACTOR = 110.54f;
 
 // ------------------------------------------------------------
 // SCALE SETTINGS
@@ -246,6 +232,24 @@ bool checkStability(float newReading)
     }
 
     return (maxVal - minVal) <= STABLE_THRESHOLD_GRAMS;
+}
+
+// Mean of the stability buffer - only meaningful once bufferFull (checkStability()
+// has pushed STABLE_READINGS consecutive real samples; earlier slots are still the
+// zero-fill from the last reset). Used for what's shown/uploaded once something is
+// actually settling on the platform, instead of whichever single raw cycle happens
+// to land at that instant - ordinary HX711 cycle-to-cycle noise (a few tenths of a
+// gram on this load cell) otherwise made the same physical object read as a
+// slightly different final number on the LCD vs. what got uploaded vs. the next
+// time it was weighed.
+float stabilityAverageGrams()
+{
+    float sum = 0.0f;
+    for (uint8_t i = 0; i < STABLE_READINGS; i++)
+    {
+        sum += stableReadings[i];
+    }
+    return sum / STABLE_READINGS;
 }
 
 // ============================================================
@@ -421,7 +425,7 @@ void setup()
     }
 
     // --------------------------------------------------------
-    // WARM-UP (10 seconds)
+    // WARM-UP (30 seconds, WARMUP_TIME_MS)
     // --------------------------------------------------------
 
     warmUpScale();
@@ -455,12 +459,6 @@ void setup()
     else
     {
         Serial.println("[SCALE] Tare complete.");
-
-        // Fold the tray's weight into the tare offset itself, once, here -
-        // see the comment on PLATFORM_TARE_GRAMS above for why this must
-        // not also be re-applied per-loop.
-        long platformOffsetCounts = (long)(PLATFORM_TARE_GRAMS * CALIBRATION_FACTOR + 0.5f);
-        loadCell.setOffset(loadCell.getOffset() + platformOffsetCounts);
 
         Serial.print("[SCALE] Tare offset: ");
         Serial.println(loadCell.getOffset());
@@ -595,6 +593,28 @@ void loop()
     }
 
     // --------------------------------------------------------
+    // STABILITY TRACKING
+    // --------------------------------------------------------
+    //
+    // Pushed here, before display/live-weight/upload below all read the
+    // buffer, so the averaged value they use already includes this cycle's
+    // own sample rather than lagging a cycle behind.
+
+    bool nowStable = false;
+
+    if (weightGrams >= UPLOAD_MIN_GRAMS && !uploadedThisLoad)
+    {
+        nowStable = checkStability(weightGrams);
+    }
+
+    // What actually gets shown/sent: once real samples fill the stability
+    // buffer, the settled average - see stabilityAverageGrams(). Before
+    // that (nothing on the platform yet, or an item only just placed),
+    // falls back to this cycle's raw reading, since there's no real
+    // buffer yet to average.
+    float reportedGrams = bufferFull ? stabilityAverageGrams() : weightGrams;
+
+    // --------------------------------------------------------
     // CONVERT
     // --------------------------------------------------------
 
@@ -614,10 +634,15 @@ void loop()
     // LCD OUTPUT
     // --------------------------------------------------------
     //
-    // Shows the raw reading directly - get_units(READING_SAMPLES) already
-    // averages within one reading, and easing toward each new value across
-    // cycles (as this used to do) made placing an object look like the
-    // display was "counting" up to it instead of just showing the weight.
+    // Shows reportedGrams (the settled stability-buffer average once one
+    // exists - see above) rather than this cycle's raw reading directly -
+    // get_units(READING_SAMPLES) already averages WITHIN one reading, but
+    // ordinary cycle-to-cycle HX711 noise on top of that still made the
+    // same physical object show a different number moment to moment.
+    // Easing toward each new value across cycles (as this used to do
+    // instead) made placing an object look like the display was "counting"
+    // up to it, which is why this is a plain average of real recent
+    // samples rather than a decaying blend toward the latest one.
     //
     // Skipped entirely once a load is confirmed/uploaded (uploadedThisLoad)
     // so the screen stays on the "Saved: ..." message and keeps matching
@@ -628,7 +653,7 @@ void loop()
 
     if (!uploadedThisLoad)
     {
-        displayWeightGrams = weightGrams;
+        displayWeightGrams = reportedGrams;
         display.showWeight(displayWeightGrams, displayWeightGrams / 1000.0f);
     }
 
@@ -653,14 +678,12 @@ void loop()
         millis() - lastLiveUpdateTime >= 5000)
     {
         lastLiveUpdateTime = millis();
-        firebase.updateLiveWeight(weightGrams);
+        firebase.updateLiveWeight(reportedGrams);
     }
 
 
     if (weightGrams >= UPLOAD_MIN_GRAMS && !uploadedThisLoad)
     {
-        bool nowStable = checkStability(weightGrams);
-
         if (nowStable)
         {
             // Start stability timer on first stable detection
@@ -676,23 +699,23 @@ void loop()
             {
                 Serial.println("[SCALE] Stable confirmed. Uploading...");
 
-                // Same whole-gram value the normal weighing screen just
-                // showed this same cycle (see displayWeightGrams above).
-                display.showError("Uploading...", String(displayWeightGrams, 0) + " g");
+                // Same value the normal weighing screen just showed this
+                // same cycle (see displayWeightGrams above).
+                display.showError("Uploading...", String(displayWeightGrams, 1) + " g");
 
                 if (firebase.isReady())
                 {
                     bool uploaded =
-                        firebase.uploadWeight(weightGrams, weightKg);
+                        firebase.uploadWeight(reportedGrams, reportedGrams / 1000.0f);
 
                     if (uploaded)
                     {
                         uploadedThisLoad        = true;
                         isStable                = false;
-                        lastUploadedWeightGrams = weightGrams;
+                        lastUploadedWeightGrams = reportedGrams;
 
                         Serial.println("[SCALE] Upload SUCCESS.");
-                        display.showError("Saved:", String(displayWeightGrams, 0) + " g");
+                        display.showError("Saved:", String(displayWeightGrams, 1) + " g");
                         delay(1500);
                     }
                     else
@@ -707,7 +730,7 @@ void loop()
                     Serial.println("[SCALE] Firebase not ready — skipping upload.");
                     uploadedThisLoad        = true;   // Skip, don't retry forever
                     isStable                = false;
-                    lastUploadedWeightGrams = weightGrams;
+                    lastUploadedWeightGrams = reportedGrams;
                 }
             }
         }
