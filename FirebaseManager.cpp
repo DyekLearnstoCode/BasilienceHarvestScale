@@ -59,6 +59,22 @@ const char* SECRET_FILE    = "/device_secret.txt";
 const char* REFRESH_FILE   = "/refresh_token.txt";
 const char* DEVICE_ID_FILE = "/device_id.txt";
 
+// Pending-measurement record — three small flat files rather than one JSON
+// blob, matching the credential files above: each field stays independently
+// readable/writable with no read-modify-write merge risk, and it avoids
+// pulling in a JSON library (not otherwise used anywhere in this firmware)
+// just to persist three scalars.
+const char* PENDING_GRAMS_FILE           = "/pending_grams.txt";
+const char* PENDING_CAPTURED_EPOCH_FILE  = "/pending_captured_epoch.txt";
+const char* PENDING_UPTIME_FILE          = "/pending_uptime_ms.txt";
+const char* PENDING_MEASUREMENT_ID_FILE  = "/pending_measurement_id.txt";
+
+// Independent of the pending-measurement record itself - this counter must
+// keep advancing (and stay durable) even across a staging attempt that
+// fails partway through, so a later successful attempt never reuses an id.
+// See generateMeasurementId() below.
+const char* MEASUREMENT_SEQUENCE_FILE = "/measurement_seq.txt";
+
 String readTextFile(const char* path)
 {
     if (!LittleFS.exists(path)) { return ""; }
@@ -72,16 +88,60 @@ String readTextFile(const char* path)
     return value;
 }
 
-void writeTextFile(const char* path, const String& value)
+// Returns whether the write actually succeeded — stagePendingWeight() below
+// must never report a physical measurement as captured on the strength of a
+// write it can't confirm happened.
+//
+// Writes to a temporary sibling file first, then replaces the canonical
+// path with LittleFS.rename() - rather than opening the canonical path
+// directly in "w" mode, which truncates it to zero bytes immediately and
+// would leave that truncated/empty file behind for good if power is lost
+// before the new content is fully written and closed. With this pattern,
+// the canonical file is only ever touched by the rename step itself, once
+// the new content is already fully and durably written to the temp file.
+//
+// Residual power-loss window: this ESP8266 LittleFS port does not publish a
+// hard atomicity guarantee for rename() the way, say, POSIX rename(2) does.
+// A power loss during the rename call itself could still (in principle)
+// leave the canonical path missing rather than holding either the old or
+// the new content - a strictly smaller and different failure mode than the
+// old in-place truncate (which had a much longer exposure window, spanning
+// the entire data write), but not a mathematically proven zero-risk one.
+bool writeTextFile(const char* path, const String& value)
 {
-    File f = LittleFS.open(path, "w");
+    String tmpPath = String(path) + ".tmp";
+
+    File f = LittleFS.open(tmpPath, "w");
     if (!f)
     {
-        Serial.println("[SECURITY] Unable to persist credential file");
-        return;
+        Serial.println("[SECURITY] Unable to open temp file for write");
+        return false;
     }
-    f.print(value);
+
+    size_t written = f.print(value);
+    f.flush();
     f.close();
+
+    if (written != (size_t)value.length())
+    {
+        Serial.println("[SECURITY] Temp file write incomplete");
+        LittleFS.remove(tmpPath);
+        return false;
+    }
+
+    // Try a direct rename first (fully atomic if this LittleFS port
+    // supports replacing an existing destination in one operation). Only
+    // fall back to a separate remove-then-rename if that's refused - this
+    // reopens a brief window where `path` doesn't exist, but bounded to a
+    // single filesystem metadata operation rather than the old write's full
+    // duration.
+    if (LittleFS.rename(tmpPath, path)) { return true; }
+
+    LittleFS.remove(path);
+    if (LittleFS.rename(tmpPath, path)) { return true; }
+
+    Serial.println("[SECURITY] Unable to finalize file replace (rename failed)");
+    return false;
 }
 
 } // namespace
@@ -99,7 +159,14 @@ FirebaseManager::FirebaseManager(
       _databaseURL(databaseURL),
       _bootstrapDeviceSecret(bootstrapDeviceSecret),
       _ready(false),
-      _readingCount(0)
+      _readingCount(0),
+      _localStorageReady(false),
+      _hasPendingWeight(false),
+      _pendingGrams(0.0f),
+      _pendingCapturedAtEpoch(0),
+      _pendingUptimeMs(0),
+      _pendingMeasurementId(""),
+      _pendingCapturedThisBoot(false)
 {
 }
 
@@ -119,10 +186,12 @@ bool FirebaseManager::begin()
     Serial.println(" FIREBASE INIT");
     Serial.println("====================================");
 
-    if (!LittleFS.begin())
-    {
-        Serial.println("[SECURITY] LittleFS mount failed - device identity cannot persist across reboots");
-    }
+    // Idempotent - a no-op if the .ino already called this in setup()
+    // before WiFi, which it does, so pending-measurement persistence works
+    // even on a unit that never reaches the internet. Called again here too
+    // since this function also needs LittleFS for credentials, and begin()
+    // itself is now re-callable (see the retry logic in loop()).
+    beginLocalStorage();
 
     _config.api_key      = _apiKey;
     _config.database_url = _databaseURL;
@@ -177,10 +246,18 @@ bool FirebaseManager::begin()
 
     bool authenticated = trySecureAuthentication();
 
-    if (!authenticated)
+    // A refresh token can authenticate successfully while /device_id.txt is
+    // separately missing/corrupt (they're two independent files) -
+    // trySecureAuthentication() already tries to recover this by falling
+    // through to a fresh bootstrap (which re-resolves and persists
+    // deviceId server-side) whenever that happens, but this is the final
+    // guard: never let _ready become true with an empty _deviceId, since
+    // deviceRoot() would silently build a malformed "/devices//harvestScale"
+    // path and every subsequent read/write would go to the wrong place.
+    if (!authenticated || _deviceId.length() == 0)
     {
         Serial.println();
-        Serial.println("[FB] ERROR: Secure device authentication failed.");
+        Serial.println("[FB] ERROR: Secure device authentication failed or device identity unavailable.");
         Serial.println("[FB] Check the device secret and bootstrap endpoint.");
         _ready = false;
         return false;
@@ -222,10 +299,24 @@ bool FirebaseManager::trySecureAuthentication()
         Serial.println("[SECURITY] Stored refresh token found");
         if (restoreFromRefreshToken(refreshToken))
         {
-            Serial.println("[SECURITY] Refresh-token authentication succeeded");
-            return true;
+            // The refresh token and the device-ID file are two independent
+            // LittleFS files - a refresh-grant sign-in can succeed while
+            // /device_id.txt is separately missing/corrupt. Don't accept
+            // this as a full success in that case; fall through to the
+            // bootstrap path below instead, which re-resolves and persists
+            // a fresh deviceId server-side rather than leaving this device
+            // "authenticated" with no identity to write data under.
+            if (_deviceId.length() > 0)
+            {
+                Serial.println("[SECURITY] Refresh-token authentication succeeded");
+                return true;
+            }
+            Serial.println("[SECURITY] Refresh-token authentication succeeded but device identity is missing/corrupt - falling back to bootstrap to recover it");
         }
-        Serial.println("[SECURITY] Refresh-token authentication failed");
+        else
+        {
+            Serial.println("[SECURITY] Refresh-token authentication failed");
+        }
     }
 
     if (secret.length() > 0)
@@ -483,6 +574,145 @@ void FirebaseManager::saveDeviceId(const String& id)
 }
 
 // ============================================================
+// LOCAL STORAGE — mount + pending-measurement recovery
+// ============================================================
+//
+// Deliberately independent of WiFi/Firebase auth: called from the .ino's
+// setup() before WiFi is even attempted, so a confirmed physical
+// measurement can always be persisted, on a unit that never reaches the
+// internet at all. begin() above also calls this (idempotently) since it
+// separately needs LittleFS for credentials.
+//
+
+bool FirebaseManager::beginLocalStorage()
+{
+    if (_localStorageReady) { return true; }
+
+    if (!LittleFS.begin())
+    {
+        Serial.println("[SECURITY] LittleFS mount failed - device identity and pending measurements cannot persist");
+        return false;
+    }
+
+    _localStorageReady = true;
+    loadPendingWeightFromDisk();
+    return true;
+}
+
+void FirebaseManager::loadPendingWeightFromDisk()
+{
+    String gramsStr    = readTextFile(PENDING_GRAMS_FILE);
+    String capturedStr = readTextFile(PENDING_CAPTURED_EPOCH_FILE);
+    String uptimeStr   = readTextFile(PENDING_UPTIME_FILE);
+    String idStr       = readTextFile(PENDING_MEASUREMENT_ID_FILE);
+
+    if (gramsStr.isEmpty())
+    {
+        _hasPendingWeight = false;
+        return;
+    }
+
+    _pendingGrams           = gramsStr.toFloat();
+    _pendingCapturedAtEpoch = (uint32_t)capturedStr.toInt();
+    _pendingUptimeMs        = (uint32_t)uptimeStr.toInt();
+    _pendingMeasurementId   = idStr;
+    _hasPendingWeight       = _pendingGrams > 0.0f;
+
+    // Recovered from flash at boot, NOT staged during this running process -
+    // _pendingUptimeMs was written by a PREVIOUS boot's millis(), which has
+    // no relationship whatsoever to this boot's millis() clock. See
+    // _pendingCapturedThisBoot's declaration in the header.
+    _pendingCapturedThisBoot = false;
+
+    if (_hasPendingWeight && _pendingMeasurementId.isEmpty())
+    {
+        // Migration path: a pending measurement staged by firmware BEFORE
+        // this measurementId scheme existed. Generate one now and persist
+        // it immediately so it's stable from this point forward - every
+        // syncPendingWeight() retry from here on (this boot or any later
+        // one) reuses this exact id, same as a measurement staged fresh.
+        String migratedId;
+        if (generateMeasurementId(migratedId))
+        {
+            _pendingMeasurementId = migratedId;
+            writeTextFile(PENDING_MEASUREMENT_ID_FILE, _pendingMeasurementId);
+            Serial.print("[FB] Pending measurement missing an id (pre-upgrade) - assigned ");
+            Serial.println(_pendingMeasurementId);
+        }
+        else
+        {
+            // Can't safely assign one right now (flash write failed) - next
+            // boot's recovery gets another chance; leaving the id empty here
+            // would make syncPendingWeight() unable to build a valid path.
+            Serial.println("[FB] WARNING: Unable to assign measurementId to recovered pending measurement");
+        }
+    }
+
+    if (_hasPendingWeight)
+    {
+        // Survives an ESP restart/power loss by design - this is exactly
+        // that recovery happening: a measurement captured before this boot
+        // that never confirmed as synced is picked back up here, and the
+        // normal loop()/syncPendingWeight() retry logic takes it from here.
+        Serial.print("[FB] Pending measurement recovered from flash: ");
+        Serial.print(_pendingGrams, 1);
+        Serial.print(" g | id: ");
+        Serial.println(_pendingMeasurementId);
+    }
+}
+
+void FirebaseManager::clearPendingWeightFile()
+{
+    if (_localStorageReady)
+    {
+        LittleFS.remove(PENDING_GRAMS_FILE);
+        LittleFS.remove(PENDING_CAPTURED_EPOCH_FILE);
+        LittleFS.remove(PENDING_UPTIME_FILE);
+        LittleFS.remove(PENDING_MEASUREMENT_ID_FILE);
+    }
+    _hasPendingWeight        = false;
+    _pendingGrams            = 0.0f;
+    _pendingCapturedAtEpoch  = 0;
+    _pendingUptimeMs         = 0;
+    _pendingMeasurementId    = "";
+    _pendingCapturedThisBoot = false;
+}
+
+// ============================================================
+// MEASUREMENT ID — offline-safe, collision-free, stable across retries
+// ============================================================
+//
+// "HS_<chipId>_<sequence>": chipId (ESP.getChipId()) identifies the
+// physical unit, needs no network and never changes; sequence is a
+// monotonic counter persisted independently of the pending-measurement
+// record, advanced durably as the very FIRST step of every call - before
+// the caller has done anything else that could fail. That ordering is what
+// makes the required guarantee hold: a gap in the sequence (this call
+// succeeds but the measurement staging that follows it fails) is harmless,
+// but the same sequence value being handed out twice is not, since two
+// different physical measurements would then collide on one RTDB path.
+//
+
+bool FirebaseManager::generateMeasurementId(String& outId)
+{
+    if (!_localStorageReady && !beginLocalStorage()) { return false; }
+
+    uint32_t sequence = (uint32_t)readTextFile(MEASUREMENT_SEQUENCE_FILE).toInt();
+    sequence++;
+
+    if (!writeTextFile(MEASUREMENT_SEQUENCE_FILE, String(sequence)))
+    {
+        // Could not durably advance the counter - do NOT hand out an id
+        // built from it, since an un-persisted increment could be handed
+        // out again (reused) on a later call after a reboot.
+        return false;
+    }
+
+    outId = "HS_" + String(ESP.getChipId(), HEX) + "_" + String(sequence);
+    return true;
+}
+
+// ============================================================
 // LIVE WEIGHT — updates devices/{deviceId}/harvestScale/liveWeight
 // ============================================================
 //
@@ -509,47 +739,169 @@ bool FirebaseManager::updateLiveWeight(float grams)
 }
 
 // ============================================================
-// HARVEST LOG — pushes to devices/{deviceId}/harvestScale/harvests
-// on stable reading only
+// PENDING MEASUREMENT — CAPTURE != UPLOAD
 // ============================================================
 //
-// Uses pushJSON() — creates a new auto-ID entry each call.
-// Only called once per stable weighing event.
+// A confirmed physical weighing is persisted to flash FIRST (this is what
+// "captured" means from the .ino's point of view) and only pushed to RTDB
+// once Firebase is actually ready to accept it - possibly much later, on a
+// following loop() cycle, or after a reconnect. The old design conflated
+// the two: it uploaded directly and, if Firebase happened to be
+// unavailable at that exact moment, marked the load "handled" anyway with
+// nothing ever written anywhere - the measurement was gone. This can no
+// longer happen: stagePendingWeight() only ever reports success once the
+// flash write itself is confirmed, and syncPendingWeight() only ever
+// clears that persisted record after RTDB confirms the push landed.
 //
 
-bool FirebaseManager::uploadWeight(float grams, float kg)
+bool FirebaseManager::stagePendingWeight(float grams, uint32_t capturedAtEpochSec)
 {
-    if (!isReady())
+    if (!(grams > 0.0f) || isnan(grams) || isinf(grams)) { return false; }
+
+    // One slot only (see the header comment) - never silently overwrite an
+    // already-staged, not-yet-synced measurement with a new physical
+    // capture. The .ino is expected to check hasPendingWeight() itself
+    // before even attempting a new capture, but this is the enforcement
+    // point that actually matters.
+    if (_hasPendingWeight) { return false; }
+
+    if (!_localStorageReady && !beginLocalStorage()) { return false; }
+
+    // Generated FIRST, before any of this measurement's own fields are
+    // written: this call durably advances the sequence counter itself as
+    // its own first step, so even if everything below fails partway, no
+    // future measurement can ever be handed this same id again. See
+    // generateMeasurementId().
+    String measurementId;
+    if (!generateMeasurementId(measurementId)) { return false; }
+
+    bool persisted =
+        writeTextFile(PENDING_GRAMS_FILE, String(grams, 4)) &&
+        writeTextFile(PENDING_CAPTURED_EPOCH_FILE, String(capturedAtEpochSec)) &&
+        writeTextFile(PENDING_UPTIME_FILE, String((unsigned long)millis())) &&
+        writeTextFile(PENDING_MEASUREMENT_ID_FILE, measurementId);
+
+    if (!persisted)
     {
-        Serial.println("[FB] ERROR: Not ready.");
+        // A partial write is worse than no write at all - a future boot
+        // loading a half-written record would trust a grams value with no
+        // matching timestamp/id, or vice versa. Clean slate instead; the
+        // physical measurement is NOT considered captured, so the caller's
+        // own stability hold can simply retry on its next qualifying cycle
+        // (which calls generateMeasurementId() again and gets a fresh,
+        // never-before-used id - the sequence gap left behind here is
+        // expected and harmless).
+        clearPendingWeightFile();
         return false;
     }
 
+    _hasPendingWeight        = true;
+    _pendingGrams            = grams;
+    _pendingCapturedAtEpoch  = capturedAtEpochSec;
+    _pendingUptimeMs         = (uint32_t)millis();
+    _pendingMeasurementId    = measurementId;
+    // Staged right here, in this running process - see the header comment
+    // on this member for why that's exactly what makes reconstructing
+    // capturedAt from elapsed uptime safe later, in syncPendingWeight().
+    _pendingCapturedThisBoot = true;
+    return true;
+}
+
+bool FirebaseManager::hasPendingWeight() const
+{
+    return _hasPendingWeight;
+}
+
+float FirebaseManager::getPendingGrams() const
+{
+    return _hasPendingWeight ? _pendingGrams : 0.0f;
+}
+
+// Writes devices/{deviceId}/harvestScale/harvests/{measurementId} via
+// setJSON() — deliberately NOT pushJSON(). pushJSON() mints a brand-new key
+// on every single call, so a retry after an AMBIGUOUS network outcome (the
+// write actually reached RTDB and was stored, but the success response
+// itself was lost, so this firmware believes it failed) would push a SECOND
+// entry for the exact same physical weighing - the Firestore consumption
+// registry on the app side can't catch this, because two different RTDB
+// keys look like two independent measurements to it. setJSON() to a path
+// fixed by this measurement's own stable measurementId (generated once, at
+// stage time - see generateMeasurementId()) means every retry, no matter
+// how many, overwrites the SAME node with the SAME content instead.
+bool FirebaseManager::syncPendingWeight()
+{
+    if (!_hasPendingWeight) { return false; }
+    if (_pendingMeasurementId.isEmpty()) { return false; } // see loadPendingWeightFromDisk()'s migration-failure path
+    if (!isReady()) { return false; }
+
+    // Same NTP-sync-sanity check used elsewhere in this file (begin()) -
+    // an un-synced clock reads as roughly the Unix epoch, so anything
+    // before "a couple hours past 1970" is treated as "no real clock yet"
+    // rather than fabricating a false timestamp.
+    uint32_t syncedAtEpoch = (time(nullptr) > 8 * 3600 * 2) ? (uint32_t)time(nullptr) : 0;
+
+    // capturedAt was 0 at staging time only if the clock genuinely wasn't
+    // synced yet at that exact moment - reconstruct it here from elapsed
+    // uptime ONLY when this pending measurement was staged during THIS same
+    // boot (_pendingCapturedThisBoot), which is the one condition that
+    // actually proves _pendingUptimeMs and millis() right now share the
+    // same clock origin. A measurement recovered from a PREVIOUS boot
+    // (_pendingCapturedThisBoot false) can never be reconstructed this way
+    // - millis() resets on every reboot, so there is no valid arithmetic
+    // relationship between that old uptime value and this boot's millis().
+    // capturedAt simply stays 0 in that case, on purpose: the app side
+    // (HarvestScaleReading.effectiveTimestampEpochSec()) must treat an
+    // unverifiable capture time as exactly that, never as "just captured."
+    uint32_t capturedAtToSend = _pendingCapturedAtEpoch;
+
+    if (capturedAtToSend == 0 && _pendingCapturedThisBoot && syncedAtEpoch != 0)
+    {
+        uint32_t elapsedMs  = (uint32_t)millis() - _pendingUptimeMs; // unsigned subtraction - correct even across one millis() rollover
+        uint32_t elapsedSec = elapsedMs / 1000;
+
+        if (elapsedSec <= syncedAtEpoch) // sanity guard against an underflowed/bogus result
+        {
+            capturedAtToSend = syncedAtEpoch - elapsedSec;
+            Serial.print("[FB] Reconstructed capturedAt from same-boot uptime: ");
+            Serial.println(capturedAtToSend);
+        }
+    }
+
+    // Passed as double, not float/int: a float's 24-bit mantissa cannot
+    // exactly hold a ~1.7-billion-second epoch timestamp (corrupting it by
+    // tens of seconds), and this library's exact integer-type overload set
+    // isn't verifiable from this repo alone (the HX711/Firebase_ESP_Client
+    // library sources aren't vendored here) - double's 53-bit mantissa
+    // exactly represents every value these fields can hold on this
+    // firmware (uint32_t epoch seconds, uint32_t millis) with no risk of
+    // hitting an unsupported overload.
     FirebaseJson json;
+    json.set("grams",         _pendingGrams);
+    json.set("kg",             _pendingGrams / 1000.0f);
+    json.set("capturedAt",    (double)capturedAtToSend);
+    json.set("syncedAt",      (double)syncedAtEpoch);
+    json.set("uptimeMs",      (double)_pendingUptimeMs);
+    json.set("measurementId",  _pendingMeasurementId);
 
-    json.set("grams",  grams);
-    json.set("kg",     kg);
-    json.set("millis", (int)millis());
+    String path = deviceRoot() + "/harvests/" + _pendingMeasurementId;
 
-    String path = deviceRoot() + "/harvests";
-
-    if (Firebase.RTDB.pushJSON(&_fbData, path, &json))
+    if (!Firebase.RTDB.setJSON(&_fbData, path, &json))
     {
-        _readingCount++;
-
-        Serial.print("[FB] Harvest logged: ");
-        Serial.print(grams, 1);
-        Serial.print(" g | Key: ");
-        Serial.println(_fbData.pushName());
-
-        return true;
-    }
-    else
-    {
-        Serial.print("[FB] Upload failed: ");
+        Serial.print("[FB] Pending measurement sync failed: ");
         Serial.println(_fbData.errorReason());
-        return false;
+        return false; // pending record stays on disk (same measurementId) - retried next call
     }
+
+    _readingCount++;
+
+    Serial.print("[FB] Pending measurement synced: ");
+    Serial.print(_pendingGrams, 1);
+    Serial.print(" g | id: ");
+    Serial.println(_pendingMeasurementId);
+
+    // Clear ONLY now that RTDB has confirmed the write - never before.
+    clearPendingWeightFile();
+    return true;
 }
 
 // ============================================================

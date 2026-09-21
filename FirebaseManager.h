@@ -29,10 +29,41 @@
 //   devices/{deviceId}/harvestScale/
 //     liveWeight : float  ← live reading (overwrite every loop)
 //     harvests/
-//       {auto-id}/
-//         grams  : float
-//         kg     : float
-//         millis : unsigned long
+//       {measurementId}/    ← child key IS the canonical measurementId,
+//                              generated ONCE when the physical measurement
+//                              is staged (see "MEASUREMENT ID" below) and
+//                              written with setJSON() - never pushJSON().
+//                              A retry after an uncertain network outcome
+//                              (push landed, response lost) reuses this
+//                              same key and overwrites the same node
+//                              in-place instead of creating a duplicate.
+//         grams      : float
+//         kg         : float
+//         capturedAt : epoch seconds when the physical measurement was
+//                      confirmed - 0 only when the scale genuinely could
+//                      not establish (or reconstruct, within the same boot
+//                      - see syncPendingWeight()) when it was captured.
+//                      Never a fabricated value, and never syncedAt used
+//                      as a stand-in.
+//         syncedAt   : epoch seconds when this entry was actually written
+//                      here (may be well after capturedAt if the device
+//                      was offline in between - see the pending-measurement
+//                      API below)
+//         uptimeMs   : device uptime (millis()) at capture, for diagnostics
+//
+// CAPTURE != UPLOAD — a confirmed physical weighing is persisted to flash
+// (stagePendingWeight()) before network availability ever enters the
+// picture, and only cleared from flash once RTDB confirms the write
+// (syncPendingWeight()). See the pending-measurement API below.
+//
+// MEASUREMENT ID — generated once, offline, the instant a measurement is
+// staged: "HS_<chipId>_<sequence>", where chipId is this unit's own
+// ESP.getChipId() (fixed in silicon, needs no network) and sequence is a
+// monotonic counter persisted to flash independently of the pending record
+// itself, so it survives even a failed staging attempt. Gaps in the
+// sequence are fine; the same value is never reused. This ID is what makes
+// a retry after an ambiguous network outcome idempotent - see
+// stagePendingWeight()/syncPendingWeight() below.
 // ============================================================
 
 class FirebaseManager
@@ -71,6 +102,18 @@ public:
     bool isReady() const;
 
     // --------------------------------------------------------
+    // LOCAL STORAGE  (call once in setup(), BEFORE WiFi)
+    // --------------------------------------------------------
+    //
+    // Mounts LittleFS and recovers any pending measurement left over from
+    // a previous boot (e.g. the device lost power/Wi-Fi before it could
+    // sync). Independent of WiFi/Firebase entirely - a confirmed physical
+    // measurement must be persistable even on a unit that has never once
+    // reached the internet. Idempotent: safe to call again (from begin()
+    // below, which also needs LittleFS) without remounting.
+    bool beginLocalStorage();
+
+    // --------------------------------------------------------
     // LIVE WEIGHT  (call every loop)
     // --------------------------------------------------------
 
@@ -79,12 +122,36 @@ public:
     bool updateLiveWeight(float grams);
 
     // --------------------------------------------------------
-    // HARVEST LOG  (call once per stable reading)
+    // PENDING MEASUREMENT  (capture ≠ upload — see .cpp)
     // --------------------------------------------------------
+    //
+    // A confirmed physical weighing is persisted to flash BEFORE it is
+    // considered "captured," and stays persisted until Firebase actually
+    // confirms the write - network availability must never determine
+    // whether the physical measurement exists. One slot only: this is a
+    // standalone single-platform scale, not a multi-entry offline queue.
 
-    // Pushes a new entry to devices/{deviceId}/harvestScale/harvests
-    // with an auto-ID. Only fires when weight is confirmed stable.
-    bool uploadWeight(float grams, float kg);
+    // Validates, persists to flash, and only THEN reports success. Refuses
+    // (returns false) if a pending measurement is already staged — the
+    // caller must not overwrite an unsynced measurement with a new one.
+    bool stagePendingWeight(float grams, uint32_t capturedAtEpochSec);
+
+    bool hasPendingWeight() const;
+
+    // What's currently staged, for LCD display while unsynced. Meaningless
+    // (returns 0) when hasPendingWeight() is false.
+    float getPendingGrams() const;
+
+    // Writes (or re-writes) exactly one RTDB entry, at a fixed path keyed by
+    // this measurement's stable measurementId, for the staged measurement -
+    // via setJSON(), never pushJSON(), so a retry always lands on the SAME
+    // node instead of minting a new one. Clears the local pending file ONLY
+    // after Firebase confirms the write succeeded; on any failure (including
+    // an ambiguous one - the write may have actually landed) the pending
+    // record is left untouched so a later call safely retries the identical
+    // write. No-op (returns false) if nothing is pending or Firebase isn't
+    // ready.
+    bool syncPendingWeight();
 
     // --------------------------------------------------------
     // STATS
@@ -106,6 +173,42 @@ private:
     bool     _ready;
     uint32_t _readingCount;
     String   _deviceId;
+
+    // Pending-measurement state, mirrored between RAM and small flat
+    // LittleFS files (same "small flat files, no read-modify-write merge
+    // risk" pattern already used for the auth credentials below) so
+    // hasPendingWeight()/getPendingGrams() are cheap enough to call every
+    // loop() cycle without touching flash each time.
+    bool     _localStorageReady;
+    bool     _hasPendingWeight;
+    float    _pendingGrams;
+    uint32_t _pendingCapturedAtEpoch;
+    uint32_t _pendingUptimeMs;
+    String   _pendingMeasurementId;
+
+    // True only while the currently-staged pending measurement was captured
+    // during THIS running process (a real stagePendingWeight() call, not one
+    // recovered from flash by loadPendingWeightFromDisk() at boot). This is
+    // what proves - not just assumes - that _pendingUptimeMs is directly
+    // comparable to millis() right now, which is what makes reconstructing
+    // capturedAt from elapsed uptime in syncPendingWeight() safe. Never
+    // persisted to flash: it must default to false on every fresh boot, and
+    // loadPendingWeightFromDisk() only ever runs once per boot (see
+    // beginLocalStorage()'s idempotency guard), so this is set correctly by
+    // construction, not by tracking reboots explicitly.
+    bool _pendingCapturedThisBoot;
+
+    void loadPendingWeightFromDisk();
+    void clearPendingWeightFile();
+
+    // Offline-safe, collision-free measurementId: "HS_<chipId>_<sequence>".
+    // Advances (and durably persists) the sequence counter as its first
+    // step, before this call can fail for any other reason - see the .cpp
+    // for why a gap is acceptable here but reuse is not. Returns false (and
+    // leaves outId untouched) only if the counter itself could not be
+    // durably advanced, in which case the caller must not stage a
+    // measurement at all rather than risk a reused/unstable id.
+    bool generateMeasurementId(String& outId);
 
     // devices/{deviceId}/harvestScale — every RTDB path this class
     // touches lives under here, matching the rules' devices/$deviceId

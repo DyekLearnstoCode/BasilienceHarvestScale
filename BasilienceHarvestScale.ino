@@ -1,3 +1,5 @@
+#include <time.h>
+
 #include "LoadCellManager.h"
 #include "DisplayManager.h"
 #include "NetworkManager.h"
@@ -129,6 +131,20 @@ constexpr uint8_t      STABLE_READINGS        = 6;
 constexpr unsigned long STABLE_HOLD_MS        = 3000;
 
 // ------------------------------------------------------------
+// FIREBASE RECONNECT
+// ------------------------------------------------------------
+//
+// firebase.begin() used to run exactly once, in setup() - if WiFi wasn't
+// up yet at that point, or the auth handshake failed transiently, Firebase
+// stayed permanently unready for the rest of that boot with no way to
+// recover short of a power cycle. Retried from loop() now instead (see the
+// FIREBASE RECONNECT / PENDING SYNC RETRY block below), cooldown-gated so
+// this never re-runs the multi-second NTP+auth sequence on every 500ms
+// cycle - only every 30s, and only while actually not yet ready.
+//
+constexpr unsigned long FIREBASE_RETRY_INTERVAL_MS = 30000;
+
+// ------------------------------------------------------------
 // OBJECTS
 // ------------------------------------------------------------
 
@@ -155,15 +171,16 @@ FirebaseManager firebase(
 // STATE
 // ------------------------------------------------------------
 
-unsigned long lastReadingTime    = 0;
-unsigned long lastLiveUpdateTime = 0;   // Throttle Firebase liveWeight updates
+unsigned long lastReadingTime      = 0;
+unsigned long lastLiveUpdateTime   = 0;   // Throttle Firebase liveWeight updates
+unsigned long lastFirebaseRetryTime = 0;  // Cooldown for re-attempting firebase.begin()
 
-// What's actually shown on the LCD - a plain copy of the raw weightGrams,
-// updated only while no confirmed load is holding the screen frozen (see
-// the LCD OUTPUT block in loop()). Kept as its own variable (rather than
-// reading weightGrams directly at display time) so the "Uploading..."/
-// "Saved:" messages can show the exact same number the weighing screen
-// last displayed, and so it still holds that value while frozen.
+// What's actually shown on the LCD - a plain copy of reportedGrams, updated
+// only while no confirmed load is holding the screen frozen (see the LCD
+// OUTPUT block in loop()). Kept as its own variable (rather than reading
+// reportedGrams directly at display time) so the "Pending Sync"/"Saved:"
+// messages can show the exact same number the weighing screen last
+// displayed, and so it still holds that value while frozen.
 float displayWeightGrams = 0.0f;
 
 // Stability tracking
@@ -172,8 +189,29 @@ uint8_t       stableIndex      = 0;
 bool          bufferFull       = false;
 unsigned long stableStartTime  = 0;
 bool          isStable         = false;
-bool          uploadedThisLoad = false;   // Prevent duplicate uploads
-float         lastUploadedWeightGrams = 0.0f;   // What the confirmed liveWeight/harvest entry was for
+
+// Whether the CURRENT physical load has already produced a confirmed
+// measurement - NOT whether it reached Firebase. A measurement is
+// "captured" the instant it's durably staged to flash (see
+// FirebaseManager::stagePendingWeight()); syncing to RTDB can happen
+// later, or on a retry, without this ever needing to be re-evaluated.
+// Renamed from the old uploadedThisLoad, which conflated "captured" with
+// "upload succeeded" - the actual cause of measurements silently
+// disappearing whenever Firebase happened to be unavailable at the exact
+// moment a weighing stabilized (see the removed "Firebase not ready -
+// skipping upload" branch this replaces).
+bool  capturedThisLoad = false;
+
+// Whether ANY load ≥ UPLOAD_MIN_GRAMS is currently on the platform,
+// regardless of capturedThisLoad - tracks the physical weighing SESSION
+// itself, separately from whether it happened to already produce a
+// confirmed measurement. Used purely to detect the active→empty
+// transition exactly once (see the RESET block in loop()), so stability
+// state is always reset when the platform empties - even if this load
+// was removed mid-sample or mid-hold and never actually got captured.
+bool  loadActive = false;
+
+float lastCapturedWeightGrams = 0.0f;   // What the last confirmed measurement (this load) was for - restack detection
 
 // ============================================================
 // HELPERS
@@ -369,6 +407,23 @@ void setup()
     loadCell.setCalibrationFactor(CALIBRATION_FACTOR);
 
     // --------------------------------------------------------
+    // LOCAL STORAGE
+    // --------------------------------------------------------
+    //
+    // Deliberately BEFORE WiFi - a confirmed physical measurement must be
+    // persistable even on a unit that never reaches a network at all.
+    // Recovers any pending measurement left over from a previous boot
+    // (power/WiFi lost before it could sync) so it survives an ESP restart.
+    // firebase.begin() further below also mounts this (idempotently) since
+    // it separately needs LittleFS for auth credentials.
+    //
+
+    if (!firebase.beginLocalStorage())
+    {
+        Serial.println("[SCALE] WARNING: Local storage unavailable - a confirmed measurement could not be recovered/persisted across reboots.");
+    }
+
+    // --------------------------------------------------------
     // WIFI
     // --------------------------------------------------------
 
@@ -555,17 +610,31 @@ void loop()
     }
 
     // --------------------------------------------------------
-    // RESET UPLOAD FLAG WHEN SCALE IS EMPTY AGAIN
+    // RESET PHYSICAL WEIGHING SESSION WHEN SCALE IS EMPTY AGAIN
     // --------------------------------------------------------
+    //
+    // Fires on the active→empty TRANSITION (loadActive was true), not on
+    // capturedThisLoad specifically - a load pulled off mid-sample or
+    // mid-hold, before ever producing a confirmed measurement, must reset
+    // exactly the same as one that was fully captured. The old check here
+    // (`if (uploadedThisLoad)`) left the stability buffer, isStable, and
+    // stableStartTime all still populated from the removed load whenever
+    // nothing had been uploaded yet - a similar weight placed back down
+    // could inherit stale samples instead of starting completely fresh.
+    //
+    // Deliberately does NOT touch anything in `firebase` - a pending,
+    // not-yet-synced measurement is a SEPARATE concept from this local
+    // physical-load state and must survive the platform being emptied.
+    //
 
     if (weightGrams < UPLOAD_MIN_GRAMS)
     {
-        if (uploadedThisLoad)
+        if (loadActive)
         {
-            Serial.println("[SCALE] Load removed. Ready for next.");
-            uploadedThisLoad        = false;
-            lastUploadedWeightGrams = 0.0f;
+            Serial.println("[SCALE] Platform empty. Weighing session reset.");
             resetStabilityBuffer(0.0f);
+            capturedThisLoad = false;
+            loadActive       = false;
         }
     }
 
@@ -576,7 +645,7 @@ void loop()
     // The reset above only fires once the platform empties - so weight
     // added on TOP of an already-confirmed load, or partially taken back
     // off without dropping below UPLOAD_MIN_GRAMS, would otherwise never
-    // re-enter the stability/upload logic below, and the new total would
+    // re-enter the stability/capture logic below, and the new total would
     // never get logged or reach liveWeight (frozen once locked, below).
     // Meaningfully different from what was last confirmed in EITHER
     // direction (same threshold the stability check itself uses for "is
@@ -584,27 +653,89 @@ void loop()
     // fresh load: re-open tracking for the NEW total rather than
     // requiring a full clear-and-reload.
     //
+    // Gated on !firebase.hasPendingWeight(): if the last confirmed
+    // measurement hasn't synced yet, the previous physical measurement is
+    // still "in flight" from the platform's point of view - restack must
+    // not reopen tracking for a second measurement that could contend
+    // with it. Resumes on its own the moment the pending one clears.
+    //
 
-    if (uploadedThisLoad && fabsf(weightGrams - lastUploadedWeightGrams) > STABLE_THRESHOLD_GRAMS)
+    if (capturedThisLoad && !firebase.hasPendingWeight() &&
+        fabsf(weightGrams - lastCapturedWeightGrams) > STABLE_THRESHOLD_GRAMS)
     {
         Serial.println("[SCALE] Weight changed on the platform - re-evaluating.");
-        uploadedThisLoad = false;
+        capturedThisLoad = false;
         restartStabilityTracking();
+    }
+
+    // --------------------------------------------------------
+    // FIREBASE RECONNECT / PENDING SYNC RETRY
+    // --------------------------------------------------------
+    //
+    // firebase.begin() only ever ran once, in setup() - retried here
+    // instead whenever WiFi is up but Firebase itself isn't ready yet,
+    // cooldown-gated to FIREBASE_RETRY_INTERVAL_MS so this never re-runs
+    // the multi-second NTP+auth sequence every 500ms cycle. Runs before
+    // STABILITY TRACKING below so a sync that completes THIS cycle can
+    // already unblock capture on this same cycle instead of lagging one
+    // behind.
+    //
+    // ALSO gated on the platform being empty this cycle (weightGrams below
+    // UPLOAD_MIN_GRAMS): firebase.begin() performs NTP sync + a full TLS
+    // auth handshake and can legitimately block for several seconds to
+    // over ten. Running it while something is actively resting on the
+    // platform would starve HX711 sampling for that entire span - the
+    // stability buffer keeps advancing on wall-clock time (STABLE_HOLD_MS)
+    // without ever actually observing the object holding still, so the
+    // very next sample after the block could satisfy the hold timer
+    // immediately even though nothing was genuinely watched settle. A
+    // pending, already-persisted measurement is never blocked by this -
+    // syncPendingWeight() just below is a normal, fast RTDB write that
+    // only ever runs once Firebase is ALREADY ready, so it's left
+    // ungated.
+    //
+
+    bool platformEmpty = weightGrams < UPLOAD_MIN_GRAMS;
+
+    if (platformEmpty && network.isConnected() && !firebase.isReady() &&
+        millis() - lastFirebaseRetryTime >= FIREBASE_RETRY_INTERVAL_MS)
+    {
+        lastFirebaseRetryTime = millis();
+        Serial.println("[FB] Retrying Firebase initialization (platform empty)...");
+        firebase.begin();
+    }
+
+    if (firebase.isReady() && firebase.hasPendingWeight())
+    {
+        firebase.syncPendingWeight();
     }
 
     // --------------------------------------------------------
     // STABILITY TRACKING
     // --------------------------------------------------------
     //
-    // Pushed here, before display/live-weight/upload below all read the
+    // Pushed here, before display/live-weight/capture below all read the
     // buffer, so the averaged value they use already includes this cycle's
     // own sample rather than lagging a cycle behind.
+    //
+    // Gated on !pendingBlocksCapture (see below): while an earlier
+    // measurement is still unsynced, a NEW load must not accumulate
+    // stability samples at all - this is the one-slot design (Part H):
+    // exactly one unsynced measurement at a time, correctness over an
+    // offline queue. Tracking simply resumes, from a clean buffer, the
+    // moment the pending measurement clears.
 
     bool nowStable = false;
+    bool pendingBlocksCapture = firebase.hasPendingWeight();
 
-    if (weightGrams >= UPLOAD_MIN_GRAMS && !uploadedThisLoad)
+    if (weightGrams >= UPLOAD_MIN_GRAMS)
     {
-        nowStable = checkStability(weightGrams);
+        loadActive = true;
+
+        if (!capturedThisLoad && !pendingBlocksCapture)
+        {
+            nowStable = checkStability(weightGrams);
+        }
     }
 
     // What actually gets shown/sent: once real samples fill the stability
@@ -634,24 +765,53 @@ void loop()
     // LCD OUTPUT
     // --------------------------------------------------------
     //
-    // Shows reportedGrams (the settled stability-buffer average once one
-    // exists - see above) rather than this cycle's raw reading directly -
-    // get_units(READING_SAMPLES) already averages WITHIN one reading, but
-    // ordinary cycle-to-cycle HX711 noise on top of that still made the
-    // same physical object show a different number moment to moment.
-    // Easing toward each new value across cycles (as this used to do
-    // instead) made placing an object look like the display was "counting"
-    // up to it, which is why this is a plain average of real recent
-    // samples rather than a decaying blend toward the latest one.
-    //
-    // Skipped entirely once a load is confirmed/uploaded (uploadedThisLoad)
-    // so the screen stays on the "Saved: ..." message and keeps matching
-    // what was actually written to Firebase, instead of drifting with
-    // ordinary noise on a physically unchanged load. Restack detection
-    // above re-enables this the moment the weight genuinely changes.
+    // Four distinct states, checked in this order:
+    //   1. A measurement is pending sync (firebase.hasPendingWeight()):
+    //        - the exact load that produced it is STILL physically on the
+    //          platform (weightGrams >= UPLOAD_MIN_GRAMS && capturedThisLoad)
+    //          -> show its confirmed value, "Pending Sync / {g} g" - the
+    //          persisted pending grams, not an unstable raw reading.
+    //        - otherwise - platform is empty (that load was removed), or a
+    //          DIFFERENT new load is present and blocked from capture
+    //          entirely while the one pending slot is occupied (see
+    //          STABILITY TRACKING above) -> show "Pending Sync / Check
+    //          WiFi". Showing the stored grams here would misleadingly
+    //          suggest the scale still physically reads that weight (empty
+    //          case) or that it's weighing this new item (blocked case).
+    //          The pending record on flash is completely untouched either
+    //          way - this is display-only; nothing here clears or alters
+    //          it.
+    //   2. Nothing pending, platform empty (weightGrams < UPLOAD_MIN_GRAMS)
+    //      -> "Ready" screen. Also what's reached once a pending sync
+    //      finally succeeds while the platform is empty (hasPendingWeight()
+    //      goes false, falls straight through to here next cycle) and once
+    //      a captured-and-saved load is removed (see state 4 below).
+    //   3. Not yet captured, something on the platform (!capturedThisLoad,
+    //      nothing pending, weightGrams >= UPLOAD_MIN_GRAMS) -> normal live
+    //      weighing screen, reportedGrams as before - unchanged.
+    //   4. Captured and fully synced (capturedThisLoad, nothing pending) ->
+    //      falls through untouched, leaving the "Saved: ..." message the
+    //      capture block below already wrote on-screen. Restack detection
+    //      above re-opens state 3 the moment the weight genuinely changes;
+    //      removing the load re-enters state 2 above.
     //
 
-    if (!uploadedThisLoad)
+    if (pendingBlocksCapture)
+    {
+        if (weightGrams >= UPLOAD_MIN_GRAMS && capturedThisLoad)
+        {
+            display.showError("Pending Sync", String(firebase.getPendingGrams(), 1) + " g");
+        }
+        else
+        {
+            display.showError("Pending Sync", "Check WiFi");
+        }
+    }
+    else if (platformEmpty)
+    {
+        display.showError("Ready", "Place harvest");
+    }
+    else if (!capturedThisLoad)
     {
         displayWeightGrams = reportedGrams;
         display.showWeight(displayWeightGrams, displayWeightGrams / 1000.0f);
@@ -665,24 +825,25 @@ void loop()
     // Calling every 500ms would flood the board and cause crashes.
     //
     // Frozen at the confirmed value once a load is locked in
-    // (uploadedThisLoad) instead of continuing to overwrite it with
-    // ordinary raw-reading noise - the harvests/ entry is the source of
-    // truth once logged, so a live number that keeps wiggling next to an
-    // already-confirmed one reads as contradictory. Restack detection
-    // above re-opens this the instant enough extra weight is added to be
-    // a real new total rather than noise.
+    // (capturedThisLoad) or while a pending measurement is blocking a new
+    // one, instead of continuing to overwrite it with ordinary raw-reading
+    // noise - the harvests/ entry is the source of truth once logged, so a
+    // live number that keeps wiggling next to an already-confirmed (or
+    // still-syncing) one reads as contradictory. Restack detection above
+    // re-opens this the instant enough extra weight is added to be a real
+    // new total rather than noise.
     //
 
     if (firebase.isReady() &&
-        !uploadedThisLoad &&
+        !capturedThisLoad &&
+        !pendingBlocksCapture &&
         millis() - lastLiveUpdateTime >= 5000)
     {
         lastLiveUpdateTime = millis();
         firebase.updateLiveWeight(reportedGrams);
     }
 
-
-    if (weightGrams >= UPLOAD_MIN_GRAMS && !uploadedThisLoad)
+    if (weightGrams >= UPLOAD_MIN_GRAMS && !capturedThisLoad && !pendingBlocksCapture)
     {
         if (nowStable)
         {
@@ -694,43 +855,58 @@ void loop()
                 Serial.println("[SCALE] Weight stable — waiting to confirm...");
             }
 
-            // Upload after stable hold time
+            // Confirm after stable hold time
             if (millis() - stableStartTime >= STABLE_HOLD_MS)
             {
-                Serial.println("[SCALE] Stable confirmed. Uploading...");
+                Serial.println("[SCALE] Stable confirmed. Capturing measurement...");
 
-                // Same value the normal weighing screen just showed this
-                // same cycle (see displayWeightGrams above).
-                display.showError("Uploading...", String(displayWeightGrams, 1) + " g");
+                // capturedAt: the physical measurement's own timestamp,
+                // set the moment it's confirmed - epoch seconds if the
+                // clock is synced, 0 if it genuinely isn't (never a faked
+                // absolute time). Same NTP-sync sanity check FirebaseManager
+                // itself uses.
+                uint32_t capturedAtEpoch =
+                    (time(nullptr) > 8 * 3600 * 2) ? (uint32_t)time(nullptr) : 0;
 
-                if (firebase.isReady())
+                if (firebase.stagePendingWeight(reportedGrams, capturedAtEpoch))
                 {
-                    bool uploaded =
-                        firebase.uploadWeight(reportedGrams, reportedGrams / 1000.0f);
+                    // CAPTURED the instant this returns true - persisted to
+                    // flash already, regardless of what happens next. This
+                    // is the fix for the old "Firebase not ready - skipping
+                    // upload" branch: network state can no longer make a
+                    // confirmed physical measurement disappear.
+                    capturedThisLoad        = true;
+                    isStable                = false;
+                    lastCapturedWeightGrams = reportedGrams;
 
-                    if (uploaded)
+                    Serial.println("[SCALE] Measurement captured and persisted locally.");
+
+                    // Best-effort immediate sync - most of the time
+                    // Firebase is already up and this is instant. If not,
+                    // the pending record stays on disk exactly as staged,
+                    // and the FIREBASE RECONNECT / PENDING SYNC RETRY block
+                    // above picks it up automatically on a later cycle -
+                    // no separate retry path needed.
+                    if (firebase.isReady() && firebase.syncPendingWeight())
                     {
-                        uploadedThisLoad        = true;
-                        isStable                = false;
-                        lastUploadedWeightGrams = reportedGrams;
-
-                        Serial.println("[SCALE] Upload SUCCESS.");
                         display.showError("Saved:", String(displayWeightGrams, 1) + " g");
-                        delay(1500);
                     }
                     else
                     {
-                        Serial.println("[SCALE] Upload FAILED.");
-                        display.showError("Upload failed!", "Check WiFi/FB");
-                        delay(1500);
+                        display.showError("Pending Sync", String(displayWeightGrams, 1) + " g");
                     }
+                    delay(1500);
                 }
                 else
                 {
-                    Serial.println("[SCALE] Firebase not ready — skipping upload.");
-                    uploadedThisLoad        = true;   // Skip, don't retry forever
-                    isStable                = false;
-                    lastUploadedWeightGrams = reportedGrams;
+                    // Local persistence itself failed - the physical
+                    // measurement is explicitly NOT considered captured
+                    // (capturedThisLoad stays false), so the next
+                    // qualifying cycle retries rather than the reading
+                    // being silently discarded.
+                    Serial.println("[SCALE] ERROR: Unable to persist measurement locally.");
+                    display.showError("Save failed!", "Retrying...");
+                    delay(1000);
                 }
             }
         }
