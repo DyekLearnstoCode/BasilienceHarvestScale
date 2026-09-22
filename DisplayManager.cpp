@@ -1,4 +1,5 @@
 #include "DisplayManager.h"
+#include <math.h>
 
 DisplayManager::DisplayManager(uint8_t i2cAddress, uint8_t cols, uint8_t rows)
     : _lcd(i2cAddress, cols, rows), _i2cAddress(i2cAddress),
@@ -22,12 +23,12 @@ void DisplayManager::showBoot() { if (!_available) return; _lcd.clear(); printCe
 void DisplayManager::showWarmUp(unsigned long s) { if (!_available) return; printPadded(0, "Warming up..."); String r = "Wait: "; r += s; r += " sec"; printPadded(1, r); }
 void DisplayManager::showTaring() { if (!_available) return; _lcd.clear(); printCentered(0, "Taring..."); printCentered(1, "Keep empty!"); }
 void DisplayManager::showReady() { if (!_available) return; _lcd.clear(); printCentered(0, "Scale Ready!"); printCentered(1, "Place item..."); }
-// Shown to 1 decimal place, matching the serial/app precision - the caller
-// now passes an already-settled stability-buffer average (see
-// stabilityAverageGrams() in the .ino) rather than a single raw cycle, so
-// the jitter a whole-number rounding used to paper over is gone at the
-// source instead.
-void DisplayManager::showWeight(float g, float kg) { if (!_available) return; String r0 = String(g,1)+" g"; printPadded(0,r0); String r1=String(kg,3)+" kg"; printPadded(1,r1); }
+// Whole grams (round-half-away-from-zero) - sub-gram values aren't reliably
+// measurable on the current hardware. The caller still passes an
+// already-settled stability-buffer average (see stabilityAverageGrams() in
+// the .ino) rather than a single raw cycle; only the on-screen text is
+// rounded, the underlying float stays unrounded everywhere else.
+void DisplayManager::showWeight(float g, float kg) { if (!_available) return; String r0 = String(lroundf(g))+" g"; printPadded(0,r0); String r1=String(kg,3)+" kg"; printPadded(1,r1); }
 void DisplayManager::showError(const String& l1, const String& l2) { if (!_available) return; printPadded(0,l1); printPadded(1,l2); }
 void DisplayManager::backlightOn()  { if (_available) _lcd.backlight(); }
 void DisplayManager::backlightOff() { if (_available) _lcd.noBacklight(); }

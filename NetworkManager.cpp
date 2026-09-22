@@ -80,20 +80,36 @@ bool NetworkManager::saveCredentials(const String& ssid, const String& password)
 
 bool NetworkManager::connect(void (*onProvisioningStart)())
 {
-    if (loadCredentials(_ssid, _password) && attemptConnection())
+    if (!loadCredentials(_ssid, _password))
     {
+        // No saved credentials at all - nothing to retry in the background,
+        // so go straight to the setup portal. Deliberately non-blocking
+        // from here: this device has a fully functional local job
+        // (weighing) that does not depend on WiFi or Firebase, so it must
+        // not sit parked waiting for someone to submit credentials.
+        // startProvisioningPortal() returns immediately; update() (called
+        // every loop() iteration) services it in the background while
+        // setup() continues on into warm-up/tare/weighing.
+        Serial.println("[WIFI] No saved credentials - starting setup portal (scale continues offline)");
+        if (onProvisioningStart != nullptr) { onProvisioningStart(); }
+        startProvisioningPortal();
+        return false;
+    }
+
+    if (attemptConnection())
+    {
+        _disconnectedSince = 0;
         return true;
     }
 
-    // Deliberately non-blocking from here: this device has a fully
-    // functional local job (weighing) that does not depend on WiFi or
-    // Firebase, so it must not sit parked waiting for someone to submit
-    // credentials. startProvisioningPortal() returns immediately; update()
-    // (called every loop() iteration) services it in the background while
-    // setup() continues on into warm-up/tare/weighing.
-    Serial.println("[WIFI] No usable saved network - starting setup portal (scale continues offline)");
-    if (onProvisioningStart != nullptr) { onProvisioningStart(); }
-    startProvisioningPortal();
+    // Saved credentials exist but couldn't connect right now (router off,
+    // password changed after a router swap, temporarily out of range...).
+    // Do NOT jump straight to the setup portal on a single failed attempt -
+    // this device only gives up on saved credentials after ~30s of
+    // CONTINUED failure, handled by pollReconnect() from loop() onward (see
+    // update()). Scale continues in offline/local mode in the meantime.
+    Serial.println("[WIFI] Connection unavailable — local weighing remains active.");
+    _disconnectedSince = millis();
     return false;
 }
 
@@ -106,7 +122,7 @@ void NetworkManager::update()
         return;
     }
 
-    reconnectIfNeeded();
+    pollReconnect();
 }
 
 bool NetworkManager::isProvisioning() const
@@ -169,41 +185,72 @@ bool NetworkManager::isConnected() const
     return WiFi.status() == WL_CONNECTED;
 }
 
-bool NetworkManager::reconnectIfNeeded()
+// ============================================================
+// NON-BLOCKING RECONNECT
+// ============================================================
+//
+// The previous version of this method blocked for up to MAX_RETRIES *
+// RETRY_DELAY_MS (~10s) inside a delay() loop, called unconditionally from
+// update() every loop() iteration once a 30s cooldown elapsed - meaning a
+// missing router could stall the ENTIRE sketch, including active weighing,
+// for up to 10 seconds at a time. Fixed here by never blocking at all:
+// WiFi.begin() itself returns immediately on ESP8266 (the actual
+// association happens in the WiFi stack's own background task), so this
+// just issues that call and lets later update()/pollReconnect() calls poll
+// isConnected() - detection latency is at most one loop() iteration
+// (currently ~300ms), not a synchronous wait.
+//
+
+void NetworkManager::pollReconnect()
 {
-    if (isConnected()) { return true; }
-
-    // Only retry every 30 seconds — prevents watchdog crash
-    unsigned long now = millis();
-    if (now - _lastReconnectAttempt < RECONNECT_COOLDOWN_MS)
-    {
-        return false;
-    }
-
-    _lastReconnectAttempt = now;
-
-    Serial.println("[WIFI] Reconnecting...");
-
-    WiFi.begin(_ssid.c_str(), _password.c_str());
-
-    uint8_t retries = 0;
-
-    while (WiFi.status() != WL_CONNECTED && retries < MAX_RETRIES)
-    {
-        delay(RETRY_DELAY_MS);
-        ESP.wdtFeed();
-        retries++;
-        yield();
-    }
+    if (_ssid.isEmpty()) { return; } // never had credentials - connect() already routed this case to the portal directly
 
     if (isConnected())
     {
-        Serial.println("[WIFI] Reconnected.");
-        return true;
+        // Logged only on the TRANSITION back to connected (not every poll)
+        // - _disconnectedSince being non-zero is exactly "we were
+        // disconnected a moment ago."
+        if (_disconnectedSince != 0)
+        {
+            Serial.println("[WIFI] Connected.");
+        }
+        _disconnectedSince = 0;
+        return;
     }
 
-    Serial.println("[WIFI] Reconnect failed.");
-    return false;
+    unsigned long now = millis();
+
+    // Logged only on the TRANSITION into disconnected, not every poll -
+    // this is the one line proving to anyone watching Serial that a lost
+    // connection does NOT stop local weighing.
+    if (_disconnectedSince == 0)
+    {
+        _disconnectedSince = now;
+        Serial.println("[WIFI] Connection unavailable — local weighing remains active.");
+    }
+
+    // ~30s of continued failure to reconnect with saved credentials -> fall
+    // back to the same setup portal a from-scratch boot would open, so
+    // obsolete credentials (router replaced, password changed) are
+    // recoverable without a manual reflash. Checked before the retry
+    // cooldown below so it still fires even on a cycle that would otherwise
+    // also be due for another WiFi.begin() attempt.
+    if (now - _disconnectedSince >= RECONNECT_TIMEOUT_BEFORE_PORTAL_MS)
+    {
+        Serial.println("[WIFI] Starting Basilience-Scale-Setup.");
+        startProvisioningPortal();
+        return;
+    }
+
+    // Not logged per-attempt (unlike the rest of this method's transition-
+    // only logging, this would otherwise repeat every RECONNECT_RETRY_
+    // INTERVAL_MS for the whole outage) - the connect/disconnect
+    // transition lines above already say everything useful here.
+    if (now - _lastReconnectAttempt < RECONNECT_RETRY_INTERVAL_MS) { return; }
+    _lastReconnectAttempt = now;
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(_ssid.c_str(), _password.c_str());
 }
 
 String NetworkManager::getIPAddress() const
@@ -232,6 +279,8 @@ void NetworkManager::startProvisioningPortal()
     Serial.println("====================================");
     Serial.println(" WIFI SETUP PORTAL");
     Serial.println("====================================");
+
+    _disconnectedSince = 0; // no longer meaningful once we're in provisioning mode
 
     WiFi.mode(WIFI_AP);
     const IPAddress apIp(192, 168, 4, 1);
@@ -274,6 +323,8 @@ void NetworkManager::setupAPServer()
         String newSsid = _server.arg("ssid");
         String newPassword = _server.hasArg("password") ? _server.arg("password") : "";
 
+        Serial.println("[WIFI] New credentials received.");
+
         if (newSsid.length() > MAX_SSID_LEN)
         {
             Serial.println("[AP HTTP] Rejected: SSID too long");
@@ -293,17 +344,48 @@ void NetworkManager::setupAPServer()
             return;
         }
 
-        Serial.print("[AP HTTP] SSID received: ");
+        Serial.print("[AP HTTP] Verifying new network before saving: ");
         Serial.println(newSsid);
 
-        if (!saveCredentials(newSsid, newPassword))
+        // Validate BEFORE persisting - do not overwrite still-possibly-
+        // usable saved credentials with ones that turn out to be wrong (a
+        // typo'd password, a network that's out of range from where the
+        // portal's being set up, etc). WIFI_AP_STA keeps THIS portal
+        // connection itself alive on the AP interface while the STA side
+        // tests the new network, so a response can be sent back either way
+        // - a plain WiFi.mode(WIFI_STA) here would drop the phone's
+        // connection to the AP before it could ever receive it.
+        WiFi.mode(WIFI_AP_STA);
+        WiFi.begin(newSsid.c_str(), newPassword.c_str());
+
+        uint8_t retries = 0;
+        while (WiFi.status() != WL_CONNECTED && retries < MAX_RETRIES)
         {
-            Serial.println("[AP HTTP] Unable to persist credentials");
-            _server.send(500, "text/plain", "Unable to save credentials");
+            delay(RETRY_DELAY_MS);
+            ESP.wdtFeed();
+            retries++;
+            yield();
+        }
+
+        if (WiFi.status() != WL_CONNECTED)
+        {
+            Serial.println("[AP HTTP] New network could not be verified - not saved, portal remains open");
+            WiFi.mode(WIFI_AP); // drop the failed STA attempt, keep serving the portal as AP-only
+            _server.send(200, "text/html", buildSetupFailureHtml());
             return;
         }
 
-        Serial.println("[AP] Credentials saved");
+        Serial.println("[AP HTTP] New network verified");
+
+        if (!saveCredentials(newSsid, newPassword))
+        {
+            Serial.println("[AP HTTP] Unable to persist verified credentials");
+            WiFi.mode(WIFI_AP);
+            _server.send(500, "text/plain", "Verified but unable to save credentials - try again");
+            return;
+        }
+
+        Serial.println("[AP] Credentials verified and saved");
         _server.send(200, "text/html", buildSetupSuccessHtml());
 
         delay(1000);
@@ -412,6 +494,18 @@ String NetworkManager::buildSetupSuccessHtml() const
         "<div class=\"badge badge--check\">&#10003;</div>"
         "<h1>Saved</h1>"
         "<p class=\"sub\">Restarting the scale so it can join your Wi-Fi network...</p>";
+
+    return pageShell(body);
+}
+
+String NetworkManager::buildSetupFailureHtml() const
+{
+    String body =
+        "<div class=\"badge badge--check\">&#33;</div>"
+        "<h1>Couldn't Connect</h1>"
+        "<p class=\"sub\">That network couldn't be reached. Double-check the name and password and try again "
+        "- nothing was changed, and the scale is still weighing locally.</p>"
+        "<a href=\"/\" style=\"display:block;text-align:center;color:#116F59;font-weight:600;text-decoration:none;margin-top:8px\">&larr; Try again</a>";
 
     return pageShell(body);
 }

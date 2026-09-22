@@ -1,4 +1,5 @@
 #include <time.h>
+#include <math.h>
 
 #include "LoadCellManager.h"
 #include "DisplayManager.h"
@@ -81,23 +82,23 @@ constexpr float CALIBRATION_FACTOR = 110.54f;
 // ------------------------------------------------------------
 
 constexpr uint8_t  TARE_SAMPLES        = 30;
-constexpr uint8_t  READING_SAMPLES     = 10;
+constexpr uint8_t  READING_SAMPLES     = 3;    // was 10 - the 3-sample median filter below provides the rejection this used to rely on the HX711 average alone for
 constexpr unsigned long HX711_TIMEOUT_MS   = 1500;
-constexpr unsigned long READING_INTERVAL_MS = 500;
+constexpr unsigned long READING_INTERVAL_MS = 300;   // was 500
 
 // ------------------------------------------------------------
 // WARM-UP
 // ------------------------------------------------------------
 //
-// Lowered from 60s - that was a conservative round-number default, not a
-// value actually tuned to this specific load cell/HX711 pairing. 30s is
-// still a deliberate, cautious choice (this is a one-time boot-time cost,
-// paid every power-on) while cutting the wait roughly in half. If harvest
-// weighings taken shortly after boot ever look drifted compared to ones
-// taken later in the same session, that's a sign this needs to go back up
-// rather than lower still.
+// Raised back from 30s to 60s - physical testing showed the empty-platform
+// baseline can still be drifting tens of grams away from true zero shortly
+// after boot, which the 30s window wasn't giving the HX711/load cell
+// enough time to settle out of before the startup tare locked it in. This
+// is a one-time boot-time cost, paid every power-on, not a per-weighing
+// one - see EMPTY_SETTLE_MS below for the (much shorter) per-weighing
+// re-zero this same drift investigation added.
 //
-constexpr unsigned long WARMUP_TIME_MS = 30000;
+constexpr unsigned long WARMUP_TIME_MS = 60000;
 
 // ------------------------------------------------------------
 // ZERO DEADBAND
@@ -127,8 +128,62 @@ constexpr float MAX_WEIGHT_GRAMS = 20000.0f;
 
 constexpr float        UPLOAD_MIN_GRAMS       = 50.0f;
 constexpr float        STABLE_THRESHOLD_GRAMS = 10.0f;
-constexpr uint8_t      STABLE_READINGS        = 6;
-constexpr unsigned long STABLE_HOLD_MS        = 3000;
+constexpr uint8_t      STABLE_READINGS        = 5;    // was 6
+constexpr unsigned long STABLE_HOLD_MS        = 1500;  // was 3000
+
+// ------------------------------------------------------------
+// POST-REMOVAL SOFTWARE ZERO CORRECTION
+// ------------------------------------------------------------
+//
+// After a COMPLETED weighing session (capturedThisLoad already true) ends
+// with the object removed, the platform must read continuously empty for
+// EMPTY_SETTLE_MS before the firmware starts trusting readings again - not
+// on the very first below-threshold sample, which could just be platform
+// bounce or an object still being lifted off.
+//
+// IMPORTANT: this NO LONGER re-runs the HX711 hardware tare
+// (loadCell.tare()). Physical testing proved that unsafe - an automatic
+// hardware tare occasionally latched onto a transient/bad reading as the
+// new zero reference, producing wrong absolute offsets (see the commit
+// history for real examples: correct ~222-224g readings after a good tare
+// vs. the same object reading ~155-165g, or a placed object reading ~38g,
+// after a bad automatic one). The ONE hardware tare that's trusted is the
+// startup tare below, after the 60s warm-up - it never changes again for
+// the rest of this boot.
+//
+// Instead, drift is compensated entirely in software: softwareZeroBiasGrams
+// (declared in STATE below) is measured fresh after every completed
+// session's removal and SUBTRACTED from the hardware-tared reading before
+// any other processing - see SOFTWARE ZERO CORRECTION in loop(). A bad
+// baseline sample here can only ever produce a bad software bias, which is
+// validated (spread + absolute-range checks below) before being accepted,
+// and worst case just gets discarded/retried - it can never corrupt the
+// underlying HX711 tare offset itself the way the removed hardware
+// re-tare could.
+//
+constexpr unsigned long EMPTY_SETTLE_MS = 1500;
+
+// Once the platform has settled empty for EMPTY_SETTLE_MS, this many valid
+// signed sensorWeightGrams samples (hardware-tared, but NOT yet
+// bias-corrected) are collected to compute the new software zero - see
+// ZERO BASELINE SAMPLE COLLECTION in loop().
+constexpr uint8_t ZERO_BASELINE_SAMPLES = 9;
+
+// The 9-sample baseline's own (max - min) spread must be at or below this
+// before it's trusted as a genuinely stable empty reading. Too wide a
+// spread means the platform probably isn't actually settled yet (bounce,
+// vibration, something still being placed) - the baseline collection
+// simply restarts rather than accepting a noisy zero.
+constexpr float ZERO_BASELINE_MAX_SPREAD_GRAMS = 8.0f;
+
+// Defensive absolute limit: even a spread-validated baseline is rejected if
+// its median magnitude exceeds this, so a wildly wrong reading (something
+// like -185g) can never silently become the new zero - only genuine,
+// observed drift in roughly the -50 to -60g range this hardware has shown
+// is meant to pass. Rejection here does NOT fall back to a hardware tare -
+// see the class-wide comment above - it simply keeps the previous software
+// bias and keeps observing.
+constexpr float MAX_SOFTWARE_ZERO_ABS_GRAMS = 100.0f;
 
 // ------------------------------------------------------------
 // FIREBASE RECONNECT
@@ -138,8 +193,8 @@ constexpr unsigned long STABLE_HOLD_MS        = 3000;
 // up yet at that point, or the auth handshake failed transiently, Firebase
 // stayed permanently unready for the rest of that boot with no way to
 // recover short of a power cycle. Retried from loop() now instead (see the
-// FIREBASE RECONNECT / PENDING SYNC RETRY block below), cooldown-gated so
-// this never re-runs the multi-second NTP+auth sequence on every 500ms
+// FIREBASE RECONNECT block below), cooldown-gated so
+// this never re-runs the multi-second NTP+auth sequence on every reading
 // cycle - only every 30s, and only while actually not yet ready.
 //
 constexpr unsigned long FIREBASE_RETRY_INTERVAL_MS = 30000;
@@ -178,7 +233,7 @@ unsigned long lastFirebaseRetryTime = 0;  // Cooldown for re-attempting firebase
 // What's actually shown on the LCD - a plain copy of reportedGrams, updated
 // only while no confirmed load is holding the screen frozen (see the LCD
 // OUTPUT block in loop()). Kept as its own variable (rather than reading
-// reportedGrams directly at display time) so the "Pending Sync"/"Saved:"
+// reportedGrams directly at display time) so the "SAVED"/"OFFLINE"
 // messages can show the exact same number the weighing screen last
 // displayed, and so it still holds that value while frozen.
 float displayWeightGrams = 0.0f;
@@ -190,16 +245,23 @@ bool          bufferFull       = false;
 unsigned long stableStartTime  = 0;
 bool          isStable         = false;
 
-// Whether the CURRENT physical load has already produced a confirmed
-// measurement - NOT whether it reached Firebase. A measurement is
-// "captured" the instant it's durably staged to flash (see
-// FirebaseManager::stagePendingWeight()); syncing to RTDB can happen
-// later, or on a retry, without this ever needing to be re-evaluated.
-// Renamed from the old uploadedThisLoad, which conflated "captured" with
-// "upload succeeded" - the actual cause of measurements silently
-// disappearing whenever Firebase happened to be unavailable at the exact
-// moment a weighing stabilized (see the removed "Firebase not ready -
-// skipping upload" branch this replaces).
+// 3-reading median filter — sits between the raw HX711 reading and the
+// stability buffer (see NEGATIVE TRANSIENT SANITIZATION / 3-READING MEDIAN
+// FILTER in loop()). A single bad or negative-noise cycle is outvoted by
+// the other two recent readings instead of reaching stability detection
+// directly. Independent of the stability buffer's own history/state.
+float   medianWindow[3]   = { 0.0f, 0.0f, 0.0f };
+uint8_t medianFilterIndex = 0;
+uint8_t medianFilterCount = 0;   // caps at 3 - guards against uninitialized slots right after startup/reset
+
+// Whether the CURRENT physical load has already gone through the
+// capture-time decision (see the CAPTURE block in loop()) - set true the
+// instant that decision is made, regardless of whether the Firebase upload
+// it attempted succeeded, failed, or was never attempted at all. There is
+// no "captured but not yet finished" in-between state anymore: a
+// measurement either becomes an online "SAVED" or a local-only "OFFLINE"
+// result in one step, and either way this load is done - the scale is
+// immediately ready to weigh the next one.
 bool  capturedThisLoad = false;
 
 // Whether ANY load ≥ UPLOAD_MIN_GRAMS is currently on the platform,
@@ -211,11 +273,96 @@ bool  capturedThisLoad = false;
 // was removed mid-sample or mid-hold and never actually got captured.
 bool  loadActive = false;
 
-float lastCapturedWeightGrams = 0.0f;   // What the last confirmed measurement (this load) was for - restack detection
+// Post-removal software-zero state (see evaluateZeroBaseline() /
+// EMPTY_SETTLE_MS above). awaitingAutoZero is true from the moment a
+// COMPLETED session's object is detected removed until a valid new
+// softwareZeroBiasGrams is accepted (or the attempt is cancelled by a
+// returning load) - deliberately a SEPARATE flag from
+// capturedThisLoad/loadActive (both stay true throughout this window,
+// untouched) so a load returning mid-zeroing can cleanly cancel back to
+// "still captured, still on platform" without losing or reconstructing any
+// state - see the RESET block in loop().
+bool          awaitingAutoZero     = false;
+unsigned long emptySettleStartTime = 0;   // when the current settle/retry window started
+
+// True once the initial EMPTY_SETTLE_MS wait has elapsed and the firmware
+// is actively gathering the ZERO_BASELINE_SAMPLES-sample baseline (see ZERO
+// BASELINE SAMPLE COLLECTION in loop()). False during the initial settle
+// itself. Both sub-phases show the same "ZEROING..." LCD state.
+bool    collectingZeroBaseline = false;
+float   zeroBaselineSamples[ZERO_BASELINE_SAMPLES];
+uint8_t zeroBaselineCount      = 0;
+
+// Throttles "[ZERO] Empty baseline unstable — waiting." so a persistently
+// noisy empty platform logs at most once every couple seconds instead of
+// once per 300ms reading cycle.
+unsigned long lastZeroUnstableLogTime = 0;
+
+// The current best estimate of what the hardware-tared sensor reads when
+// the platform is genuinely empty - subtracted from every sensor reading
+// before any other processing (see SOFTWARE ZERO CORRECTION in loop()).
+// Reset to 0 immediately after every successful STARTUP hardware tare (see
+// setup()); from then on, only evaluateZeroBaseline() ever assigns a new
+// value, always by REPLACING it outright, never accumulating into it.
+float softwareZeroBiasGrams = 0.0f;
 
 // ============================================================
 // HELPERS
 // ============================================================
+
+// Clears the median filter's history. Called anywhere the stability buffer
+// itself is reset (see resetStabilityBuffer()/restartStabilityTracking()
+// below), so a new physical load never inherits filtered samples from
+// whatever was on the platform before.
+void resetMedianFilter()
+{
+    medianWindow[0]   = 0.0f;
+    medianWindow[1]   = 0.0f;
+    medianWindow[2]   = 0.0f;
+    medianFilterIndex = 0;
+    medianFilterCount = 0;
+}
+
+// Pushes a sanitized candidate (negative noise already floored to 0 by the
+// caller - see NEGATIVE TRANSIENT SANITIZATION in loop()) into the 3-slot
+// median filter and returns the median of however many valid samples have
+// been pushed so far.
+//
+// Below 3 samples (right after startup/reset - medianFilterCount not yet
+// full), there's no real history to outvote a bad sample with, so the
+// candidate passes through unfiltered rather than mixing in stale/
+// uninitialized slots.
+float pushMedianFilter(float candidate)
+{
+    medianWindow[medianFilterIndex] = candidate;
+    medianFilterIndex = (medianFilterIndex + 1) % 3;
+
+    if (medianFilterCount < 3) { medianFilterCount++; }
+
+    if (medianFilterCount < 3)
+    {
+        return candidate;
+    }
+
+    float a = medianWindow[0];
+    float b = medianWindow[1];
+    float c = medianWindow[2];
+
+    float lo = fminf(a, fminf(b, c));
+    float hi = fmaxf(a, fmaxf(b, c));
+
+    return a + b + c - lo - hi;   // median of 3 = sum - min - max
+}
+
+// Whole-gram LCD rounding (item 1: sub-gram values aren't reliably
+// measurable on this hardware yet). Round-half-away-from-zero, not
+// truncation. Internal values (reportedGrams, Firebase payloads, stability
+// math) stay float and unrounded - only what's printed on the 16x2 LCD is
+// rounded here.
+long displayGrams(float grams)
+{
+    return lroundf(grams);
+}
 
 // Fill stability buffer with a value (e.g. on tare/reset)
 void resetStabilityBuffer(float value = 0.0f)
@@ -229,6 +376,8 @@ void resetStabilityBuffer(float value = 0.0f)
     bufferFull      = false;
     stableStartTime = 0;
     isStable        = false;
+
+    resetMedianFilter();
 }
 
 // Re-open stability tracking for a NEW total that's still resting on the
@@ -248,6 +397,8 @@ void restartStabilityTracking()
     bufferFull      = false;
     stableStartTime = 0;
     isStable        = false;
+
+    resetMedianFilter();
 }
 
 // Push reading into circular buffer and check stability
@@ -288,6 +439,51 @@ float stabilityAverageGrams()
         sum += stableReadings[i];
     }
     return sum / STABLE_READINGS;
+}
+
+// Current min/max spread across the stability buffer - the same value
+// checkStability() compares against STABLE_THRESHOLD_GRAMS internally, but
+// exposed here too for the [SCALE] diagnostic log. 0 (not meaningful) until
+// bufferFull, same guard checkStability() itself uses.
+float stabilitySpreadGrams()
+{
+    if (!bufferFull) { return 0.0f; }
+
+    float minVal = stableReadings[0];
+    float maxVal = stableReadings[0];
+
+    for (uint8_t i = 1; i < STABLE_READINGS; i++)
+    {
+        if (stableReadings[i] < minVal) { minVal = stableReadings[i]; }
+        if (stableReadings[i] > maxVal) { maxVal = stableReadings[i]; }
+    }
+
+    return maxVal - minVal;
+}
+
+// Median of the ZERO_BASELINE_SAMPLES collected empty-baseline samples -
+// sorts a small local copy (plain insertion sort; ZERO_BASELINE_SAMPLES is
+// tiny, so this is cheap and non-blocking) and returns the middle value.
+// Preferred over a mean so ONE transient sample among the nine can't skew
+// the accepted zero.
+float medianOfZeroBaseline()
+{
+    float sorted[ZERO_BASELINE_SAMPLES];
+    for (uint8_t i = 0; i < ZERO_BASELINE_SAMPLES; i++) { sorted[i] = zeroBaselineSamples[i]; }
+
+    for (uint8_t i = 1; i < ZERO_BASELINE_SAMPLES; i++)
+    {
+        float value = sorted[i];
+        int8_t j = (int8_t)i - 1;
+        while (j >= 0 && sorted[j] > value)
+        {
+            sorted[j + 1] = sorted[j];
+            j--;
+        }
+        sorted[j + 1] = value;
+    }
+
+    return sorted[ZERO_BASELINE_SAMPLES / 2];
 }
 
 // ============================================================
@@ -350,6 +546,77 @@ void warmUpScale()
     Serial.println("[SCALE] Warm-up complete.");
 }
 
+// ============================================================
+// POST-REMOVAL SOFTWARE ZERO
+// ============================================================
+
+// Called once ZERO_BASELINE_SAMPLES valid signed samples have been
+// collected (see ZERO BASELINE SAMPLE COLLECTION in loop()) - validates
+// them and either accepts a new softwareZeroBiasGrams or restarts/holds
+// collection. Never touches the HX711 hardware tare - see this file's
+// POST-REMOVAL SOFTWARE ZERO CORRECTION comment for why that was removed.
+// Non-blocking: this is pure math over 9 already-collected floats, no
+// hardware I/O, so it costs nothing to call from inside the normal
+// reading-interval-gated loop() cycle.
+void evaluateZeroBaseline()
+{
+    float minVal = zeroBaselineSamples[0];
+    float maxVal = zeroBaselineSamples[0];
+
+    for (uint8_t i = 1; i < ZERO_BASELINE_SAMPLES; i++)
+    {
+        if (zeroBaselineSamples[i] < minVal) { minVal = zeroBaselineSamples[i]; }
+        if (zeroBaselineSamples[i] > maxVal) { maxVal = zeroBaselineSamples[i]; }
+    }
+
+    float spread = maxVal - minVal;
+
+    if (spread > ZERO_BASELINE_MAX_SPREAD_GRAMS)
+    {
+        // Throttled - a persistently unsettled platform would otherwise log
+        // this once per 300ms reading cycle for as long as it stays noisy.
+        if (millis() - lastZeroUnstableLogTime >= 2000)
+        {
+            lastZeroUnstableLogTime = millis();
+            Serial.println("[ZERO] Empty baseline unstable — waiting.");
+        }
+        zeroBaselineCount = 0; // restart collection, keep waiting
+        return;
+    }
+
+    float candidateBias = medianOfZeroBaseline();
+
+    if (fabsf(candidateBias) > MAX_SOFTWARE_ZERO_ABS_GRAMS)
+    {
+        Serial.println("[ZERO] Baseline outside safe correction range — keeping previous zero.");
+        zeroBaselineCount = 0; // restart collection, keep observing - never falls back to a hardware tare
+        return;
+    }
+
+    Serial.println("[ZERO] Software zero updated.");
+    Serial.print("[ZERO] Old bias: ");
+    Serial.print(softwareZeroBiasGrams, 1);
+    Serial.println(" g");
+    Serial.print("[ZERO] New bias: ");
+    Serial.print(candidateBias, 1);
+    Serial.println(" g");
+    Serial.print("[ZERO] Baseline spread: ");
+    Serial.print(spread, 1);
+    Serial.println(" g");
+
+    // REPLACE, never accumulate - candidateBias is always measured directly
+    // from the hardware-tared sensorWeightGrams, not relative to the old
+    // software bias.
+    softwareZeroBiasGrams = candidateBias;
+
+    resetStabilityBuffer(0.0f);
+    capturedThisLoad       = false;
+    loadActive             = false;
+    awaitingAutoZero       = false;
+    collectingZeroBaseline = false;
+    zeroBaselineCount      = 0;
+}
+
 // Shown once, right before NetworkManager blocks on the setup portal -
 // NetworkManager has no display dependency of its own, so it invokes this
 // via a plain callback instead.
@@ -410,10 +677,12 @@ void setup()
     // LOCAL STORAGE
     // --------------------------------------------------------
     //
-    // Deliberately BEFORE WiFi - a confirmed physical measurement must be
-    // persistable even on a unit that never reaches a network at all.
-    // Recovers any pending measurement left over from a previous boot
-    // (power/WiFi lost before it could sync) so it survives an ESP restart.
+    // Deliberately BEFORE WiFi - device identity and the measurement-
+    // sequence counter must be usable even on a unit that never reaches a
+    // network at all. Also clears out any pending-measurement data left
+    // behind by an earlier firmware revision that supported offline sync
+    // (see FirebaseManager::clearLegacyPendingData()) - that concept no
+    // longer exists, so nothing old can surface in Firebase later.
     // firebase.begin() further below also mounts this (idempotently) since
     // it separately needs LittleFS for auth credentials.
     //
@@ -480,7 +749,7 @@ void setup()
     }
 
     // --------------------------------------------------------
-    // WARM-UP (30 seconds, WARMUP_TIME_MS)
+    // WARM-UP (60 seconds, WARMUP_TIME_MS)
     // --------------------------------------------------------
 
     warmUpScale();
@@ -517,6 +786,13 @@ void setup()
 
         Serial.print("[SCALE] Tare offset: ");
         Serial.println(loadCell.getOffset());
+
+        // This startup tare is the ONE trusted hardware zero reference for
+        // the rest of this boot - see POST-REMOVAL SOFTWARE ZERO CORRECTION
+        // above. Any drift observed after this point is compensated in
+        // software (softwareZeroBiasGrams), never by re-taring the HX711
+        // again.
+        softwareZeroBiasGrams = 0.0f;
     }
 
     Serial.println();
@@ -561,12 +837,18 @@ void loop()
     lastReadingTime = millis();
 
     // --------------------------------------------------------
-    // READ WEIGHT
+    // READ WEIGHT (hardware-tared, calibrated sensor reading)
     // --------------------------------------------------------
+    //
+    // Despite going through loadCell's own hardware tare offset and
+    // calibration factor, this is NOT yet the final reported weight -
+    // softwareZeroBiasGrams (see below) still needs to be subtracted. Named
+    // sensorWeightGrams (not "raw") to make that distinction explicit.
+    //
 
-    float weightGrams = 0.0f;
+    float sensorWeightGrams = 0.0f;
 
-    if (!loadCell.readWeightGrams(READING_SAMPLES, weightGrams, HX711_TIMEOUT_MS))
+    if (!loadCell.readWeightGrams(READING_SAMPLES, sensorWeightGrams, HX711_TIMEOUT_MS))
     {
         Serial.println("[SCALE] ERROR: HX711 read timeout.");
         display.showError("Read timeout!", "Check HX711");
@@ -574,35 +856,32 @@ void loop()
     }
 
     // --------------------------------------------------------
-    // ZERO DEADBAND
+    // BASIC SANITY VALIDATION
     // --------------------------------------------------------
+    //
+    // Rejected outright - never inserted into the zero-baseline collection,
+    // median/stability buffers, unlike ordinary negative noise (see
+    // NEGATIVE TRANSIENT SANITIZATION further below). A NaN/Inf/overload/
+    // impossible sample means this cycle's reading can't be trusted at all,
+    // not just "reads oddly." Deliberately operates on the raw
+    // sensorWeightGrams, before any software zero correction.
+    //
 
-    if (weightGrams >= -ZERO_DEADBAND_GRAMS && weightGrams <= ZERO_DEADBAND_GRAMS)
+    if (isnan(sensorWeightGrams) || isinf(sensorWeightGrams))
     {
-        weightGrams = 0.0f;
+        Serial.println("[SCALE] ERROR: Corrupted reading (NaN/Inf).");
+        display.showError("Bad reading!", "");
+        return;
     }
 
-    // --------------------------------------------------------
-    // NEGATIVE WEIGHT HANDLING
-    // --------------------------------------------------------
-
-    if (weightGrams < 0.0f && weightGrams > -20.0f)
-    {
-        weightGrams = 0.0f;
-    }
-
-    // --------------------------------------------------------
-    // SANITY VALIDATION
-    // --------------------------------------------------------
-
-    if (weightGrams > MAX_WEIGHT_GRAMS)
+    if (sensorWeightGrams > MAX_WEIGHT_GRAMS)
     {
         Serial.println("[SCALE] ERROR: Weight exceeds 20 kg.");
         display.showError("OVERLOAD!", "Max: 20 kg");
         return;
     }
 
-    if (weightGrams < -1000.0f)
+    if (sensorWeightGrams < -1000.0f)
     {
         Serial.println("[SCALE] ERROR: Invalid negative reading.");
         display.showError("Bad reading!", "");
@@ -610,104 +889,226 @@ void loop()
     }
 
     // --------------------------------------------------------
-    // RESET PHYSICAL WEIGHING SESSION WHEN SCALE IS EMPTY AGAIN
+    // ZERO BASELINE SAMPLE COLLECTION (software zero re-acquisition)
     // --------------------------------------------------------
     //
-    // Fires on the active→empty TRANSITION (loadActive was true), not on
-    // capturedThisLoad specifically - a load pulled off mid-sample or
-    // mid-hold, before ever producing a confirmed measurement, must reset
-    // exactly the same as one that was fully captured. The old check here
-    // (`if (uploadedThisLoad)`) left the stability buffer, isStable, and
-    // stableStartTime all still populated from the removed load whenever
-    // nothing had been uploaded yet - a similar weight placed back down
-    // could inherit stale samples instead of starting completely fresh.
-    //
-    // Deliberately does NOT touch anything in `firebase` - a pending,
-    // not-yet-synced measurement is a SEPARATE concept from this local
-    // physical-load state and must survive the platform being emptied.
+    // Only active during the baseline-collection sub-phase of post-removal
+    // zeroing (see the RESET / POST-REMOVAL SOFTWARE ZERO block below) -
+    // collects the TRUE signed, hardware-tare-relative reading, before ANY
+    // correction/clamping/filtering touches it. This is deliberate: using
+    // an already bias-corrected or already negative-clamped value here
+    // would destroy exactly the information needed to compensate a
+    // negative empty-platform drift (see SOFTWARE ZERO CORRECTION below for
+    // the worked example).
     //
 
-    if (weightGrams < UPLOAD_MIN_GRAMS)
+    if (collectingZeroBaseline && zeroBaselineCount < ZERO_BASELINE_SAMPLES)
     {
-        if (loadActive)
+        zeroBaselineSamples[zeroBaselineCount] = sensorWeightGrams;
+        zeroBaselineCount++;
+    }
+
+    // --------------------------------------------------------
+    // SOFTWARE ZERO CORRECTION
+    // --------------------------------------------------------
+    //
+    // Applied BEFORE negative sanitization - subtracting the bias first
+    // (rather than clamping sensorWeightGrams to 0 first) is what correctly
+    // compensates a NEGATIVE empty-platform drift. Example: sensor reads
+    // -56g while empty, softwareZeroBiasGrams becomes -56g, so a later
+    // empty reading of -56g corrects to 0g, and a later loaded reading of
+    // 167g corrects to 167 - (-56) = 223g. Uses the OLD bias until (and
+    // unless) evaluateZeroBaseline() accepts a new one - see the ZEROING
+    // CANCELLATION check immediately below, which relies on that.
+    //
+
+    float correctedWeightGrams = sensorWeightGrams - softwareZeroBiasGrams;
+
+    // A load reappearing while a new baseline is still being measured must
+    // cancel that attempt outright - accepting a baseline collected with
+    // something (even briefly) on the platform would bake a wrong zero in.
+    // Checked here, on the raw corrected value, rather than waiting for the
+    // (necessarily lagged) median-filtered value below, so this is as
+    // responsive as possible.
+    if (awaitingAutoZero && correctedWeightGrams >= UPLOAD_MIN_GRAMS)
+    {
+        Serial.println("[SCALE] Zeroing cancelled — load detected.");
+        awaitingAutoZero       = false;
+        collectingZeroBaseline = false;
+        zeroBaselineCount      = 0;
+        // capturedThisLoad/loadActive are untouched - still true, so the
+        // scale simply resumes showing the frozen SAVED/OFFLINE result it
+        // already had, rather than starting a new capture.
+    }
+
+    // --------------------------------------------------------
+    // NEGATIVE TRANSIENT SANITIZATION
+    // --------------------------------------------------------
+    //
+    // Ordinary negative sensor noise (drift the software zero correction
+    // above didn't fully cancel, a settling knock - not the extreme/
+    // corrupted values already rejected above) is treated as 0 for
+    // filtering purposes only. correctedWeightGrams itself is left
+    // untouched for diagnostics; this candidate is what actually feeds the
+    // median filter.
+    //
+
+    float medianCandidate = (correctedWeightGrams < 0.0f) ? 0.0f : correctedWeightGrams;
+
+    // --------------------------------------------------------
+    // 3-READING MEDIAN FILTER
+    // --------------------------------------------------------
+    //
+    // A single bad/negative cycle (already floored to 0 above) is outvoted
+    // by the two other recent readings instead of reaching the stability
+    // buffer directly - e.g. {250, -45→0, 249} filters to 249, not 0.
+    //
+
+    float filteredWeightGrams = pushMedianFilter(medianCandidate);
+
+    // --------------------------------------------------------
+    // ZERO DEADBAND
+    // --------------------------------------------------------
+
+    if (filteredWeightGrams >= -ZERO_DEADBAND_GRAMS && filteredWeightGrams <= ZERO_DEADBAND_GRAMS)
+    {
+        filteredWeightGrams = 0.0f;
+    }
+
+    bool platformEmpty = filteredWeightGrams < UPLOAD_MIN_GRAMS;
+
+    // --------------------------------------------------------
+    // RESET / POST-REMOVAL SOFTWARE ZERO WHEN SCALE IS EMPTY AGAIN
+    // --------------------------------------------------------
+    //
+    // Two different "empty" cases, handled separately:
+    //
+    //   - A load pulled off mid-sample or mid-hold, before ever producing a
+    //     confirmed measurement (loadActive but !capturedThisLoad): reset
+    //     immediately, exactly as before - no re-zeroing. This is ordinary
+    //     idle/noise territory, not a completed weighing, and the scale
+    //     must NOT be constantly chasing zero while idle.
+    //
+    //   - A COMPLETED session's object being removed (loadActive AND
+    //     capturedThisLoad): do NOT reset yet. capturedThisLoad is
+    //     deliberately left true (see awaitingAutoZero's own comment) and
+    //     the post-removal software-zero sequence begins instead, in two
+    //     sub-phases:
+    //       1. Initial settle: platform must read continuously empty for
+    //          EMPTY_SETTLE_MS before anything is trusted (platform bounce/
+    //          an object still being lifted off).
+    //       2. Baseline collection: once settled, ZERO_BASELINE_SAMPLES
+    //          signed samples are gathered (see ZERO BASELINE SAMPLE
+    //          COLLECTION above) and handed to evaluateZeroBaseline(),
+    //          which validates and either accepts a new
+    //          softwareZeroBiasGrams or restarts collection - see that
+    //          function's own comment.
+    //     This is the fix for the baseline/zero drift observed in physical
+    //     testing: each new weighing starts from a freshly measured
+    //     software zero instead of whatever the empty-platform reading has
+    //     wandered to - WITHOUT ever touching the HX711 hardware tare
+    //     again after startup (a hardware re-tare here was proven unsafe -
+    //     see this file's POST-REMOVAL SOFTWARE ZERO CORRECTION comment).
+    //
+    // A load reappearing during EITHER sub-phase is handled by the ZEROING
+    // CANCELLATION check earlier in this same loop() cycle (right after
+    // correctedWeightGrams is computed) - loadActive/capturedThisLoad are
+    // never touched by that cancellation, so the scale simply resumes
+    // showing the same frozen SAVED/OFFLINE result it already had. A later
+    // removal re-enters this same block and starts a fresh attempt.
+    //
+    // Nothing to touch in `firebase` in either case - there is no
+    // persisted state tied to the previous load at all (see the CAPTURE
+    // block's comment): its outcome (SAVED or OFFLINE) was already final
+    // the instant it was decided.
+    //
+
+    if (platformEmpty)
+    {
+        if (awaitingAutoZero)
         {
-            Serial.println("[SCALE] Platform empty. Weighing session reset.");
-            resetStabilityBuffer(0.0f);
-            capturedThisLoad = false;
-            loadActive       = false;
+            if (!collectingZeroBaseline)
+            {
+                if (millis() - emptySettleStartTime >= EMPTY_SETTLE_MS)
+                {
+                    Serial.println("[SCALE] Platform settled empty — collecting zero baseline.");
+                    collectingZeroBaseline = true;
+                    zeroBaselineCount      = 0;
+                }
+                // else: still in the initial settle wait.
+            }
+            else if (zeroBaselineCount >= ZERO_BASELINE_SAMPLES)
+            {
+                evaluateZeroBaseline(); // accepts, or restarts collection - see its own comment
+            }
+            // else: still collecting samples this cycle onward.
+        }
+        else if (loadActive)
+        {
+            if (capturedThisLoad)
+            {
+                Serial.println("[SCALE] Object removed — waiting for empty platform to settle.");
+                awaitingAutoZero       = true;
+                collectingZeroBaseline = false;
+                emptySettleStartTime   = millis();
+            }
+            else
+            {
+                Serial.println("[SCALE] Platform empty. Weighing session reset.");
+                resetStabilityBuffer(0.0f);
+                loadActive = false;
+            }
         }
     }
 
     // --------------------------------------------------------
-    // RESTACK DETECTION (weight changed without a full clear)
+    // NOTE: once capturedThisLoad is true, this physical weighing session
+    // is FINAL - later drift in filteredWeightGrams (the same untouched
+    // object reading a few grams different a few seconds later) must NOT
+    // reopen capture. There used to be a restack-detection check here that
+    // did exactly that; removed because ordinary load-cell drift was
+    // enough to cross STABLE_THRESHOLD_GRAMS and silently recapture the
+    // same object at a different weight. The only way out of a captured
+    // session is the empty-platform reset/software-zero above - see RESET
+    // / POST-REMOVAL SOFTWARE ZERO WHEN SCALE IS EMPTY AGAIN.
     // --------------------------------------------------------
-    //
-    // The reset above only fires once the platform empties - so weight
-    // added on TOP of an already-confirmed load, or partially taken back
-    // off without dropping below UPLOAD_MIN_GRAMS, would otherwise never
-    // re-enter the stability/capture logic below, and the new total would
-    // never get logged or reach liveWeight (frozen once locked, below).
-    // Meaningfully different from what was last confirmed in EITHER
-    // direction (same threshold the stability check itself uses for "is
-    // this actually different, or just noise") is treated the same as a
-    // fresh load: re-open tracking for the NEW total rather than
-    // requiring a full clear-and-reload.
-    //
-    // Gated on !firebase.hasPendingWeight(): if the last confirmed
-    // measurement hasn't synced yet, the previous physical measurement is
-    // still "in flight" from the platform's point of view - restack must
-    // not reopen tracking for a second measurement that could contend
-    // with it. Resumes on its own the moment the pending one clears.
-    //
-
-    if (capturedThisLoad && !firebase.hasPendingWeight() &&
-        fabsf(weightGrams - lastCapturedWeightGrams) > STABLE_THRESHOLD_GRAMS)
-    {
-        Serial.println("[SCALE] Weight changed on the platform - re-evaluating.");
-        capturedThisLoad = false;
-        restartStabilityTracking();
-    }
-
-    // --------------------------------------------------------
-    // FIREBASE RECONNECT / PENDING SYNC RETRY
+    // FIREBASE RECONNECT
     // --------------------------------------------------------
     //
     // firebase.begin() only ever ran once, in setup() - retried here
     // instead whenever WiFi is up but Firebase itself isn't ready yet,
     // cooldown-gated to FIREBASE_RETRY_INTERVAL_MS so this never re-runs
-    // the multi-second NTP+auth sequence every 500ms cycle. Runs before
-    // STABILITY TRACKING below so a sync that completes THIS cycle can
-    // already unblock capture on this same cycle instead of lagging one
-    // behind.
+    // the multi-second NTP+auth sequence every reading cycle.
     //
-    // ALSO gated on the platform being empty this cycle (weightGrams below
-    // UPLOAD_MIN_GRAMS): firebase.begin() performs NTP sync + a full TLS
-    // auth handshake and can legitimately block for several seconds to
+    // Gated on the platform being empty this cycle (filteredWeightGrams
+    // below UPLOAD_MIN_GRAMS): firebase.begin() performs NTP sync + a full
+    // TLS auth handshake and can legitimately block for several seconds to
     // over ten. Running it while something is actively resting on the
-    // platform would starve HX711 sampling for that entire span - the
-    // stability buffer keeps advancing on wall-clock time (STABLE_HOLD_MS)
-    // without ever actually observing the object holding still, so the
-    // very next sample after the block could satisfy the hold timer
-    // immediately even though nothing was genuinely watched settle. A
-    // pending, already-persisted measurement is never blocked by this -
-    // syncPendingWeight() just below is a normal, fast RTDB write that
-    // only ever runs once Firebase is ALREADY ready, so it's left
-    // ungated.
+    // platform would starve HX711 sampling for that span - the stability
+    // buffer keeps advancing on wall-clock time (STABLE_HOLD_MS) without
+    // ever actually observing the object holding still, so the very next
+    // sample after the block could satisfy the hold timer immediately even
+    // though nothing was genuinely watched settle.
     //
-
-    bool platformEmpty = weightGrams < UPLOAD_MIN_GRAMS;
+    // Network reconnection itself (NetworkManager::pollReconnect(), via
+    // network.update() at the top of loop()) is NOT gated this way - it is
+    // genuinely non-blocking (see NetworkManager.cpp), so it's always safe
+    // to run regardless of weighing state.
+    //
+    // There is no queue-sync retry here anymore - offline measurements are
+    // never persisted or retried (see the CAPTURE block below and
+    // FirebaseManager's class comment). This block exists purely to keep
+    // Firebase authenticated and ready for the NEXT measurement.
+    //
 
     if (platformEmpty && network.isConnected() && !firebase.isReady() &&
         millis() - lastFirebaseRetryTime >= FIREBASE_RETRY_INTERVAL_MS)
     {
         lastFirebaseRetryTime = millis();
-        Serial.println("[FB] Retrying Firebase initialization (platform empty)...");
-        firebase.begin();
-    }
-
-    if (firebase.isReady() && firebase.hasPendingWeight())
-    {
-        firebase.syncPendingWeight();
+        if (firebase.begin())
+        {
+            Serial.println("[FIREBASE] Authentication restored.");
+        }
     }
 
     // --------------------------------------------------------
@@ -718,103 +1119,113 @@ void loop()
     // buffer, so the averaged value they use already includes this cycle's
     // own sample rather than lagging a cycle behind.
     //
-    // Gated on !pendingBlocksCapture (see below): while an earlier
-    // measurement is still unsynced, a NEW load must not accumulate
-    // stability samples at all - this is the one-slot design (Part H):
-    // exactly one unsynced measurement at a time, correctness over an
-    // offline queue. Tracking simply resumes, from a clean buffer, the
-    // moment the pending measurement clears.
+    // NOT gated on network/Firebase state - physical weighing state and
+    // network state are deliberately independent. A new load accumulates
+    // stability samples exactly the same whether Firebase is ready,
+    // unreachable, or mid-reconnect; the CAPTURE block below always marks
+    // this load captured once confirmed, regardless of whether the upload
+    // to Firebase succeeds - see its own comment.
 
     bool nowStable = false;
-    bool pendingBlocksCapture = firebase.hasPendingWeight();
 
-    if (weightGrams >= UPLOAD_MIN_GRAMS)
+    if (filteredWeightGrams >= UPLOAD_MIN_GRAMS)
     {
         loadActive = true;
 
-        if (!capturedThisLoad && !pendingBlocksCapture)
+        if (!capturedThisLoad)
         {
-            nowStable = checkStability(weightGrams);
+            nowStable = checkStability(filteredWeightGrams);
         }
     }
 
-    // What actually gets shown/sent: once real samples fill the stability
-    // buffer, the settled average - see stabilityAverageGrams(). Before
-    // that (nothing on the platform yet, or an item only just placed),
-    // falls back to this cycle's raw reading, since there's no real
-    // buffer yet to average.
-    float reportedGrams = bufferFull ? stabilityAverageGrams() : weightGrams;
+    // What actually gets shown/sent: once real (filtered) samples fill the
+    // stability buffer, the settled average - see stabilityAverageGrams().
+    // Before that (nothing on the platform yet, or an item only just
+    // placed), falls back to this cycle's filtered reading, since there's
+    // no real buffer yet to average.
+    float reportedGrams = bufferFull ? stabilityAverageGrams() : filteredWeightGrams;
 
     // --------------------------------------------------------
-    // CONVERT
+    // SERIAL DIAGNOSTICS
     // --------------------------------------------------------
+    //
+    // One concise line per reading cycle. sensor vs. corrected makes the
+    // software zero bias' effect obvious at a glance (e.g. sensor=-55.8
+    // corrected=0.4 while empty, or sensor=166.0 corrected=222.2 while
+    // loaded); corrected vs. filtered then shows whether a negative/noise
+    // spike occurred without it reaching the effective measurement.
+    // spread/hold are only meaningful once the stability buffer is
+    // actually full / actively holding.
+    //
 
-    float weightKg = weightGrams / 1000.0f;
+    Serial.print("[SCALE] sensor=");
+    Serial.print(sensorWeightGrams, 1);
+    Serial.print(" corrected=");
+    Serial.print(correctedWeightGrams, 1);
+    Serial.print(" filtered=");
+    Serial.print(filteredWeightGrams, 1);
+    Serial.print(" spread=");
+    Serial.print(stabilitySpreadGrams(), 1);
+    Serial.print(" stable=");
+    Serial.print(isStable ? "YES" : "NO");
 
-    // --------------------------------------------------------
-    // SERIAL OUTPUT
-    // --------------------------------------------------------
+    if (isStable)
+    {
+        Serial.print(" hold=");
+        Serial.print(millis() - stableStartTime);
+        Serial.print("/");
+        Serial.print(STABLE_HOLD_MS);
+    }
 
-    Serial.print("[SCALE] ");
-    Serial.print(weightGrams, 1);
-    Serial.print(" g | ");
-    Serial.print(weightKg, 3);
-    Serial.println(" kg");
+    Serial.println();
 
     // --------------------------------------------------------
     // LCD OUTPUT
     // --------------------------------------------------------
     //
-    // Four distinct states, checked in this order:
-    //   1. A measurement is pending sync (firebase.hasPendingWeight()):
-    //        - the exact load that produced it is STILL physically on the
-    //          platform (weightGrams >= UPLOAD_MIN_GRAMS && capturedThisLoad)
-    //          -> show its confirmed value, "Pending Sync / {g} g" - the
-    //          persisted pending grams, not an unstable raw reading.
-    //        - otherwise - platform is empty (that load was removed), or a
-    //          DIFFERENT new load is present and blocked from capture
-    //          entirely while the one pending slot is occupied (see
-    //          STABILITY TRACKING above) -> show "Pending Sync / Check
-    //          WiFi". Showing the stored grams here would misleadingly
-    //          suggest the scale still physically reads that weight (empty
-    //          case) or that it's weighing this new item (blocked case).
-    //          The pending record on flash is completely untouched either
-    //          way - this is display-only; nothing here clears or alters
-    //          it.
-    //   2. Nothing pending, platform empty (weightGrams < UPLOAD_MIN_GRAMS)
-    //      -> "Ready" screen. Also what's reached once a pending sync
-    //      finally succeeds while the platform is empty (hasPendingWeight()
-    //      goes false, falls straight through to here next cycle) and once
-    //      a captured-and-saved load is removed (see state 4 below).
-    //   3. Not yet captured, something on the platform (!capturedThisLoad,
-    //      nothing pending, weightGrams >= UPLOAD_MIN_GRAMS) -> normal live
-    //      weighing screen, reportedGrams as before - unchanged.
-    //   4. Captured and fully synced (capturedThisLoad, nothing pending) ->
-    //      falls through untouched, leaving the "Saved: ..." message the
-    //      capture block below already wrote on-screen. Restack detection
-    //      above re-opens state 3 the moment the weight genuinely changes;
-    //      removing the load re-enters state 2 above.
+    // Four states, checked in this order - deliberately independent of
+    // network/Firebase state entirely - there is no "pending sync" concept
+    // left to show (see the CAPTURE block below):
+    //   1. awaitingAutoZero -> static "ZEROING... / Please wait" - covers
+    //      the initial empty-settle wait, baseline sample collection, and
+    //      any unstable-baseline retries (see evaluateZeroBaseline()). No
+    //      fluctuating numbers, and never the signed bias itself - Serial
+    //      is where that's logged. No blocking hardware operation happens
+    //      during this state anymore (see POST-REMOVAL SOFTWARE ZERO
+    //      CORRECTION), just per-cycle sample collection.
+    //   2. Platform empty, not awaiting software zero (filteredWeightGrams
+    //      < UPLOAD_MIN_GRAMS) -> "READY / Place harvest".
+    //   3. Not yet captured, something on the platform (!capturedThisLoad)
+    //      -> static "WEIGHING... / Hold still" - the raw fluctuating
+    //      number is deliberately not shown while stabilizing.
+    //      reportedGrams is still computed and fed to stability/capture/
+    //      live-weight exactly as before.
+    //   4. Captured (capturedThisLoad) -> falls through untouched, leaving
+    //      whatever the CAPTURE block below already wrote on-screen
+    //      ("SAVED" if the Firebase upload succeeded, "OFFLINE" if it
+    //      didn't or was never attempted). Stays frozen - once captured,
+    //      nothing reopens this session except a genuine removal (see the
+    //      RESET / POST-REMOVAL SOFTWARE ZERO block above) - no lingering
+    //      network message either way.
     //
 
-    if (pendingBlocksCapture)
+    if (awaitingAutoZero)
     {
-        if (weightGrams >= UPLOAD_MIN_GRAMS && capturedThisLoad)
-        {
-            display.showError("Pending Sync", String(firebase.getPendingGrams(), 1) + " g");
-        }
-        else
-        {
-            display.showError("Pending Sync", "Check WiFi");
-        }
+        display.showError("ZEROING...", "Please wait");
     }
     else if (platformEmpty)
     {
-        display.showError("Ready", "Place harvest");
+        display.showError("READY", "Place harvest");
     }
     else if (!capturedThisLoad)
     {
+        // Item is on the platform but not yet confirmed - hide the raw
+        // fluctuating number (it used to look like the scale was
+        // "counting") and show a static message instead. displayWeightGrams
+        // is still kept up to date here so the capture block below has the
+        // right final value for the "SAVED"/"OFFLINE" message.
         displayWeightGrams = reportedGrams;
-        display.showWeight(displayWeightGrams, displayWeightGrams / 1000.0f);
+        display.showError("WEIGHING...", "Hold still");
     }
 
     // --------------------------------------------------------
@@ -822,28 +1233,26 @@ void loop()
     // --------------------------------------------------------
     //
     // Throttled — Firebase SSL calls are slow on ESP8266.
-    // Calling every 500ms would flood the board and cause crashes.
+    // Calling every reading cycle would flood the board and cause crashes.
     //
     // Frozen at the confirmed value once a load is locked in
-    // (capturedThisLoad) or while a pending measurement is blocking a new
-    // one, instead of continuing to overwrite it with ordinary raw-reading
-    // noise - the harvests/ entry is the source of truth once logged, so a
-    // live number that keeps wiggling next to an already-confirmed (or
-    // still-syncing) one reads as contradictory. Restack detection above
+    // (capturedThisLoad), instead of continuing to overwrite it with
+    // ordinary raw-reading noise - the harvests/ entry is the source of
+    // truth once logged, so a live number that keeps wiggling next to an
+    // already-confirmed one reads as contradictory. Restack detection above
     // re-opens this the instant enough extra weight is added to be a real
     // new total rather than noise.
     //
 
     if (firebase.isReady() &&
         !capturedThisLoad &&
-        !pendingBlocksCapture &&
         millis() - lastLiveUpdateTime >= 5000)
     {
         lastLiveUpdateTime = millis();
         firebase.updateLiveWeight(reportedGrams);
     }
 
-    if (weightGrams >= UPLOAD_MIN_GRAMS && !capturedThisLoad && !pendingBlocksCapture)
+    if (filteredWeightGrams >= UPLOAD_MIN_GRAMS && !capturedThisLoad)
     {
         if (nowStable)
         {
@@ -858,7 +1267,9 @@ void loop()
             // Confirm after stable hold time
             if (millis() - stableStartTime >= STABLE_HOLD_MS)
             {
-                Serial.println("[SCALE] Stable confirmed. Capturing measurement...");
+                Serial.print("[SCALE] Stable confirmed: ");
+                Serial.print(reportedGrams, 1);
+                Serial.println(" g");
 
                 // capturedAt: the physical measurement's own timestamp,
                 // set the moment it's confirmed - epoch seconds if the
@@ -868,46 +1279,45 @@ void loop()
                 uint32_t capturedAtEpoch =
                     (time(nullptr) > 8 * 3600 * 2) ? (uint32_t)time(nullptr) : 0;
 
-                if (firebase.stagePendingWeight(reportedGrams, capturedAtEpoch))
+                // The ONE deterministic decision point (see FirebaseManager's
+                // class comment): attempt the upload ONLY if WiFi is
+                // connected AND Firebase is already authenticated/ready -
+                // never a reconnect or reauth attempt here, just the single
+                // RTDB write itself, which is what keeps this bounded rather
+                // than "however long a fresh connection would take." Either
+                // way, this load is ALWAYS considered captured immediately
+                // after this decision - there is no local-persistence
+                // failure mode left to retry (nothing is written to flash
+                // for an offline result), and no later upload attempt for
+                // this measurement regardless of the outcome.
+                bool wasUploaded = false;
+
+                if (network.isConnected() && firebase.isReady())
                 {
-                    // CAPTURED the instant this returns true - persisted to
-                    // flash already, regardless of what happens next. This
-                    // is the fix for the old "Firebase not ready - skipping
-                    // upload" branch: network state can no longer make a
-                    // confirmed physical measurement disappear.
-                    capturedThisLoad        = true;
-                    isStable                = false;
-                    lastCapturedWeightGrams = reportedGrams;
-
-                    Serial.println("[SCALE] Measurement captured and persisted locally.");
-
-                    // Best-effort immediate sync - most of the time
-                    // Firebase is already up and this is instant. If not,
-                    // the pending record stays on disk exactly as staged,
-                    // and the FIREBASE RECONNECT / PENDING SYNC RETRY block
-                    // above picks it up automatically on a later cycle -
-                    // no separate retry path needed.
-                    if (firebase.isReady() && firebase.syncPendingWeight())
+                    String measurementId;
+                    if (firebase.uploadMeasurement(reportedGrams, capturedAtEpoch, measurementId))
                     {
-                        display.showError("Saved:", String(displayWeightGrams, 1) + " g");
+                        wasUploaded = true;
+                        Serial.print("[SCALE] Firebase measurement saved: ");
+                        Serial.println(measurementId);
                     }
-                    else
-                    {
-                        display.showError("Pending Sync", String(displayWeightGrams, 1) + " g");
-                    }
-                    delay(1500);
+                }
+
+                capturedThisLoad = true;
+                isStable         = false;
+
+                if (wasUploaded)
+                {
+                    display.showError("SAVED", String(displayGrams(displayWeightGrams)) + " g");
                 }
                 else
                 {
-                    // Local persistence itself failed - the physical
-                    // measurement is explicitly NOT considered captured
-                    // (capturedThisLoad stays false), so the next
-                    // qualifying cycle retries rather than the reading
-                    // being silently discarded.
-                    Serial.println("[SCALE] ERROR: Unable to persist measurement locally.");
-                    display.showError("Save failed!", "Retrying...");
-                    delay(1000);
+                    Serial.print("[SCALE] Offline/local-only measurement: ");
+                    Serial.print(reportedGrams, 1);
+                    Serial.println(" g");
+                    display.showError("OFFLINE", String(displayGrams(displayWeightGrams)) + " g");
                 }
+                delay(1500);
             }
         }
         else
