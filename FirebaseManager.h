@@ -148,6 +148,41 @@ public:
     bool uploadMeasurement(float grams, uint32_t capturedAtEpochSec, String& outMeasurementId);
 
     // --------------------------------------------------------
+    // NON-BLOCKING RECONNECT  (loop()-driven, refresh-token only)
+    // --------------------------------------------------------
+    //
+    // begin() (above) is the one-time, fully blocking setup()-time path -
+    // acceptable there since nothing else is running yet. Calling it again
+    // from loop() to recover a lost Firebase session could stall HX711
+    // sampling, the LCD, and the Wi-Fi setup portal for ~25s (NTP wait +
+    // auth wait) or, on a fresh bootstrap, far longer - unacceptable while
+    // someone could be actively placing a harvest.
+    //
+    // startReconnect()/pollReconnect() instead step through the SAME
+    // refresh-token restore begin() already does, in small non-blocking
+    // increments (one state check per call, no delay()), bounded to
+    // roughly the same NTP/auth timeouts begin() itself uses. Deliberately
+    // does NOT fall back to a fresh bootstrapSecureAuth() HTTPS POST from
+    // here - that call uses the stock (synchronous-only) HTTPClient API
+    // with no non-blocking primitive available, and converting it would be
+    // a much larger TLS/HTTP state-machine rewrite than this pass calls
+    // for. A device with no persisted refresh token yet (or one that's
+    // been permanently revoked) keeps local weighing fully available but
+    // needs a reboot to re-run the one-time bootstrap in begin() - an
+    // explicit, accepted trade-off, not a silent gap.
+    //
+
+    // Kicks off one reconnect attempt if none is already in progress -
+    // never blocks. The caller (the .ino) supplies its own cooldown gate
+    // around when this is called, same as it previously gated begin().
+    void startReconnect();
+
+    // Call every loop() iteration, unconditionally (like NetworkManager's
+    // own update()) - advances any in-progress attempt by one cheap,
+    // non-blocking step. No-op when nothing is in progress.
+    void pollReconnect();
+
+    // --------------------------------------------------------
     // STATS
     // --------------------------------------------------------
 
@@ -155,6 +190,20 @@ public:
     int getTotalReadings();
 
 private:
+
+    enum class ReconnectPhase : uint8_t
+    {
+        Idle,
+        WaitingNtp,
+        WaitingAuth
+    };
+
+    ReconnectPhase _reconnectPhase          = ReconnectPhase::Idle;
+    unsigned long  _reconnectPhaseStartedAt = 0;
+    bool           _loggedNoRefreshToken    = false;
+
+    static const unsigned long RECONNECT_NTP_TIMEOUT_MS  = 15000;
+    static const unsigned long RECONNECT_AUTH_TIMEOUT_MS = 10000;
 
     const char* _apiKey;
     const char* _databaseURL;

@@ -779,3 +779,115 @@ int FirebaseManager::getTotalReadings()
 {
     return (int)_readingCount;
 }
+
+// ============================================================
+// NON-BLOCKING RECONNECT — see the .h's class comment for why this
+// deliberately does not attempt a fresh HTTPS bootstrap.
+// ============================================================
+
+void FirebaseManager::startReconnect()
+{
+    if (_reconnectPhase != ReconnectPhase::Idle) { return; } // already in progress
+
+    if (!_localStorageReady && !beginLocalStorage()) { return; }
+
+    if (_deviceId.length() == 0) { loadDeviceId(); }
+
+    String secret, refreshToken;
+    loadDeviceAuthCredentials(secret, refreshToken);
+
+    if (refreshToken.length() == 0)
+    {
+        // Nothing this non-blocking path can do - a fresh bootstrap needs
+        // the synchronous HTTPS POST that only begin() (setup()-time) runs.
+        // Logged once per boot, not every cooldown, so a device that's
+        // never been bootstrapped doesn't spam this line every 30s.
+        if (!_loggedNoRefreshToken)
+        {
+            _loggedNoRefreshToken = true;
+            Serial.println("[FIREBASE] No stored refresh token - reconnect needs a reboot to bootstrap a new identity.");
+        }
+        return;
+    }
+
+    _config.api_key      = _apiKey;
+    _config.database_url = _databaseURL;
+    _fbData.setBSSLBufferSize(2048, 512);
+
+    Serial.println("[FIREBASE] Reconnect: syncing time via NTP...");
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+
+    _reconnectPhase          = ReconnectPhase::WaitingNtp;
+    _reconnectPhaseStartedAt = millis();
+}
+
+void FirebaseManager::pollReconnect()
+{
+    if (_reconnectPhase == ReconnectPhase::Idle) { return; }
+
+    if (_reconnectPhase == ReconnectPhase::WaitingNtp)
+    {
+        // Same NTP-sync sanity check used elsewhere in this file - no
+        // delay() here, just a single non-blocking check per call.
+        if (time(nullptr) > 8 * 3600 * 2)
+        {
+            Serial.println("[FIREBASE] Reconnect: time synced, starting auth...");
+
+            String secret, refreshToken;
+            loadDeviceAuthCredentials(secret, refreshToken);
+
+            // Same auto-detected refresh-grant sign-in restoreFromRefreshToken()
+            // uses, just polled across loop() iterations instead of a local
+            // blocking while-loop.
+            Firebase.setCustomToken(&_config, refreshToken);
+            Firebase.begin(&_config, &_auth);
+
+            _reconnectPhase          = ReconnectPhase::WaitingAuth;
+            _reconnectPhaseStartedAt = millis();
+            return;
+        }
+
+        if (millis() - _reconnectPhaseStartedAt >= RECONNECT_NTP_TIMEOUT_MS)
+        {
+            Serial.println("[FIREBASE] Reconnect: NTP sync timed out - will retry later.");
+            _reconnectPhase = ReconnectPhase::Idle;
+        }
+        return;
+    }
+
+    if (_reconnectPhase == ReconnectPhase::WaitingAuth)
+    {
+        if (Firebase.ready())
+        {
+            // Two independent files - see begin()'s matching guard.
+            if (_deviceId.length() == 0) { loadDeviceId(); }
+
+            if (_deviceId.length() == 0)
+            {
+                Serial.println("[FIREBASE] Reconnect: authenticated but device identity missing - not marking ready.");
+                _reconnectPhase = ReconnectPhase::Idle;
+                return;
+            }
+
+            const char* rotatedRefreshToken = Firebase.getRefreshToken();
+            if (rotatedRefreshToken != nullptr && strlen(rotatedRefreshToken) > 0)
+            {
+                saveRefreshToken(String(rotatedRefreshToken));
+            }
+
+            Firebase.reconnectWiFi(true);
+            _ready = true;
+
+            Serial.println("[FIREBASE] Reconnect: authentication restored.");
+            _reconnectPhase = ReconnectPhase::Idle;
+            return;
+        }
+
+        if (millis() - _reconnectPhaseStartedAt >= RECONNECT_AUTH_TIMEOUT_MS)
+        {
+            Serial.println("[FIREBASE] Reconnect: authentication timed out - will retry later.");
+            _reconnectPhase = ReconnectPhase::Idle;
+        }
+        return;
+    }
+}

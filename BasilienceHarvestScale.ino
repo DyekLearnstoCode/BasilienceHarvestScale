@@ -101,6 +101,55 @@ constexpr unsigned long READING_INTERVAL_MS = 300;   // was 500
 constexpr unsigned long WARMUP_TIME_MS = 60000;
 
 // ------------------------------------------------------------
+// ADAPTIVE WARM-UP EARLY COMPLETION
+// ------------------------------------------------------------
+//
+// WARMUP_TIME_MS above stays the hard MAXIMUM - unchanged, still 60000.
+// This section only lets warmUpScale() finish EARLIER, never later, once
+// the empty-platform baseline genuinely looks settled rather than always
+// waiting out the full window regardless of hardware behavior.
+//
+// WARMUP_MIN_TIME_MS is a hard floor before early completion is even
+// considered - deliberately the SAME 30s the warm-up window itself used
+// to be, before physical testing showed 30s wasn't always enough (see
+// WARMUP_TIME_MS's own comment above). Reusing that already-validated
+// value as the floor means an unusually fast-settling unit still gets at
+// least as much settling time as this firmware trusted before the 60s
+// increase - this can only add MORE margin than that, never less.
+//
+// The stability check itself deliberately reuses ZERO_BASELINE_MAX_SPREAD_GRAMS
+// (defined below) rather than STABLE_THRESHOLD_GRAMS - the two constants
+// answer different physical questions. STABLE_THRESHOLD_GRAMS (10g) is
+// how much a LOADED platform may still wobble while an object settles;
+// ZERO_BASELINE_MAX_SPREAD_GRAMS (8g) is how tight an EMPTY platform must
+// already be trusted to be a real zero - the same physical scenario
+// warm-up is evaluating, just before the startup tare instead of after a
+// removal. No new threshold is introduced.
+//
+constexpr unsigned long WARMUP_MIN_TIME_MS = 30000;
+
+// How often (after the minimum) the rolling warm-up window is checked.
+constexpr unsigned long WARMUP_EVAL_INTERVAL_MS = 3000;
+
+// Rolling window size for the warm-up check - same shape as
+// STABLE_READINGS (a small circular buffer, min/max spread checked), just
+// applied here to the raw pre-tare baseline instead of a captured
+// weighing. Deliberately does NOT reuse ZERO_BASELINE_SAMPLES/
+// medianOfZeroBaseline() as-is - those are sized and hardcoded for a
+// one-shot 9-sample POST-tare batch; a smaller continuously-updated
+// buffer suits a window that's re-evaluated repeatedly over a full
+// 30-60s span instead of collected once.
+constexpr uint8_t WARMUP_STABILITY_WINDOW = 5;
+
+// Consecutive passing evaluation windows required before early completion
+// is allowed - a single quiet window (~15s into a 30s floor) must not be
+// enough on its own; this needs roughly WARMUP_REQUIRED_CONSECUTIVE_PASSES
+// * WARMUP_EVAL_INTERVAL_MS (here, 3 * 3s = 9s) of CONTINUED agreement
+// before the load cell is trusted as genuinely settled rather than just
+// momentarily quiet.
+constexpr uint8_t WARMUP_REQUIRED_CONSECUTIVE_PASSES = 3;
+
+// ------------------------------------------------------------
 // ZERO DEADBAND
 // ------------------------------------------------------------
 
@@ -306,6 +355,21 @@ unsigned long lastZeroUnstableLogTime = 0;
 // value, always by REPLACING it outright, never accumulating into it.
 float softwareZeroBiasGrams = 0.0f;
 
+// Cache of what's currently on the LCD, so the per-cycle static-text
+// states (READY/WEIGHING/ZEROING, and a persisting error) aren't
+// rewritten over I2C every single ~300ms cycle when nothing has actually
+// changed - see showIfChanged() below. LiquidCrystal_I2C has no way to
+// query its own current contents, so this is tracked ourselves.
+String lastDisplayLine1;
+String lastDisplayLine2;
+bool   lastDisplayValid = false;
+
+// [PERF] timing reference points - see showIfChanged()'s neighboring
+// helpers, setup(), and the CAPTURE/RESET blocks in loop().
+unsigned long perfScaleReadyTime      = 0; // last moment the scale became available for a NEW weighing
+unsigned long perfLoadDetectedTime    = 0; // when the CURRENT load was first detected
+unsigned long perfRemovalDetectedTime = 0; // when the current object's removal was first detected
+
 // ============================================================
 // HELPERS
 // ============================================================
@@ -362,6 +426,18 @@ float pushMedianFilter(float candidate)
 long displayGrams(float grams)
 {
     return lroundf(grams);
+}
+
+// P6: skips the LCD write entirely when the requested text matches what's
+// already shown. Every loop()-driven display call goes through this (not
+// setup()'s one-shot boot messages, which never repeat anyway).
+void showIfChanged(const String& line1, const String& line2)
+{
+    if (lastDisplayValid && line1 == lastDisplayLine1 && line2 == lastDisplayLine2) { return; }
+    display.showError(line1, line2);
+    lastDisplayLine1 = line1;
+    lastDisplayLine2 = line2;
+    lastDisplayValid = true;
 }
 
 // Fill stability buffer with a value (e.g. on tare/reset)
@@ -490,7 +566,18 @@ float medianOfZeroBaseline()
 // WARM-UP
 // ============================================================
 
-void warmUpScale()
+// startTime is when the HX711 finished its own init (see setup()) - NOT
+// necessarily "now". Physical settling begins the instant the load cell is
+// powered/initialized, and everything setup() does between then and here
+// (WiFi connect, Firebase auth, boot LCD messages) happens while that
+// settling is ALREADY underway - so it counts toward the same 60s window
+// instead of being paid twice. The while condition below naturally waits
+// only for whatever's left of WARMUP_TIME_MS by the time we get here (zero
+// iterations, i.e. no wait at all, if WiFi/Firebase already burned the
+// whole 60s) - the load cell still always receives the FULL 60 seconds of
+// physical settling before tare; this only removes duplicate waiting on
+// top of that, never shortens the physical requirement itself.
+void warmUpScale(unsigned long startTime)
 {
     Serial.println();
     Serial.println("====================================");
@@ -500,9 +587,21 @@ void warmUpScale()
     Serial.println("[SCALE] Keep platform EMPTY.");
     Serial.println("[SCALE] Do NOT touch the scale.");
 
-    unsigned long startTime    = millis();
     unsigned long lastPrintTime = 0;
     unsigned long lastLcdTime   = 0;
+
+    // Adaptive early-completion state - see the ADAPTIVE WARM-UP EARLY
+    // COMPLETION comment above WARMUP_MIN_TIME_MS. Entirely inert (buffer
+    // fills, nothing else happens) until WARMUP_MIN_TIME_MS has elapsed;
+    // before that this behaves exactly like the old fixed-time wait.
+    float         warmupWindow[WARMUP_STABILITY_WINDOW];
+    uint8_t       warmupWindowCount  = 0;
+    uint8_t       warmupWindowIndex  = 0;
+    bool          haveLastWindowAvg  = false;
+    float         lastWindowAvgGrams = 0.0f;
+    uint8_t       consecutivePasses  = 0;
+    unsigned long lastEvalTime       = 0;
+    bool          completedEarly     = false;
 
     while (millis() - startTime < WARMUP_TIME_MS)
     {
@@ -538,9 +637,93 @@ void warmUpScale()
                 lastLcdTime = millis();
                 display.showWarmUp(remainingSec);
             }
+
+            // ----------------------------------------------------
+            // ADAPTIVE EARLY COMPLETION
+            // ----------------------------------------------------
+            //
+            // Untared "grams-equivalent" from the SAME rawValue already
+            // fetched above (no extra HX711 read) - tare hasn't run yet at
+            // this point in setup(), so this isn't a real weight, but
+            // spread/drift are translation-invariant: whatever constant
+            // offset the eventual tare removes cancels out of a max-min or
+            // window-to-window comparison either way.
+            float gramsEquiv = (float)rawValue / loadCell.getCalibrationFactor();
+
+            warmupWindow[warmupWindowIndex] = gramsEquiv;
+            warmupWindowIndex = (warmupWindowIndex + 1) % WARMUP_STABILITY_WINDOW;
+            if (warmupWindowCount < WARMUP_STABILITY_WINDOW) { warmupWindowCount++; }
+
+            if (elapsed >= WARMUP_MIN_TIME_MS &&
+                warmupWindowCount >= WARMUP_STABILITY_WINDOW &&
+                millis() - lastEvalTime >= WARMUP_EVAL_INTERVAL_MS)
+            {
+                lastEvalTime = millis();
+
+                float minVal = warmupWindow[0];
+                float maxVal = warmupWindow[0];
+                float sum    = warmupWindow[0];
+                for (uint8_t i = 1; i < WARMUP_STABILITY_WINDOW; i++)
+                {
+                    if (warmupWindow[i] < minVal) { minVal = warmupWindow[i]; }
+                    if (warmupWindow[i] > maxVal) { maxVal = warmupWindow[i]; }
+                    sum += warmupWindow[i];
+                }
+
+                // spread: short-term noise within THIS window (same shape
+                // as checkStability()'s own min/max spread).
+                float spread = maxVal - minVal;
+
+                // drift: how far the window's average has moved since the
+                // LAST evaluation (~WARMUP_EVAL_INTERVAL_MS ago) - catches
+                // a slow monotonic slide that a short window's own spread
+                // could miss entirely (a steady 1g/s drift barely shows up
+                // across ~5 samples spanning well under a second, but does
+                // show up compared against a checkpoint several seconds
+                // earlier). First window has no prior checkpoint, so it
+                // can't pass on drift alone yet - falls back to spread.
+                float windowAvg = sum / WARMUP_STABILITY_WINDOW;
+                float drift     = haveLastWindowAvg ? fabsf(windowAvg - lastWindowAvgGrams) : spread;
+                haveLastWindowAvg  = true;
+                lastWindowAvgGrams = windowAvg;
+
+                // Reuses ZERO_BASELINE_MAX_SPREAD_GRAMS for BOTH checks -
+                // see that constant's neighboring comment for why it (not
+                // STABLE_THRESHOLD_GRAMS) is the physically-correct
+                // threshold for an EMPTY platform.
+                bool windowPasses = (spread <= ZERO_BASELINE_MAX_SPREAD_GRAMS) &&
+                                    (drift  <= ZERO_BASELINE_MAX_SPREAD_GRAMS);
+
+                consecutivePasses = windowPasses ? (consecutivePasses + 1) : 0;
+
+                Serial.print("[WARMUP] ");
+                Serial.print(elapsed / 1000);
+                Serial.print("s | spread=");
+                Serial.print(spread, 1);
+                Serial.print(" drift=");
+                Serial.print(drift, 1);
+                Serial.print(" | ");
+                Serial.println(windowPasses ? "ok" : "waiting");
+
+                if (consecutivePasses >= WARMUP_REQUIRED_CONSECUTIVE_PASSES)
+                {
+                    Serial.print("[WARMUP] Stable early at ");
+                    Serial.print(elapsed / 1000.0f, 1);
+                    Serial.println("s");
+                    completedEarly = true;
+                    break;
+                }
+            }
         }
 
         delay(10);
+    }
+
+    if (!completedEarly)
+    {
+        Serial.print("[WARMUP] Maximum ");
+        Serial.print(WARMUP_TIME_MS / 1000);
+        Serial.println("s reached");
     }
 
     Serial.println("[SCALE] Warm-up complete.");
@@ -615,6 +798,14 @@ void evaluateZeroBaseline()
     awaitingAutoZero       = false;
     collectingZeroBaseline = false;
     zeroBaselineCount      = 0;
+
+    // [PERF] Re-armed: time since removal was first detected until the
+    // scale is available again - also becomes the new reference point for
+    // the NEXT "[PERF] Load detected" line.
+    perfScaleReadyTime = millis();
+    Serial.print("[PERF] Re-armed: +");
+    Serial.print(perfScaleReadyTime - perfRemovalDetectedTime);
+    Serial.println("ms");
 }
 
 // Shown once, right before NetworkManager blocks on the setup portal -
@@ -632,7 +823,7 @@ void showWifiSetupModeOnDisplay()
 void setup()
 {
     Serial.begin(115200);
-    delay(1000);
+    delay(200); // brief USB-serial settle - not required by any hardware init step below
 
     Serial.println();
     Serial.println("====================================");
@@ -645,7 +836,7 @@ void setup()
 
     display.begin();
     display.showBoot();
-    delay(1500);
+    delay(400); // brief branding pause - UI only, not a hardware requirement
 
     // --------------------------------------------------------
     // HX711
@@ -665,13 +856,22 @@ void setup()
         // is actually connected.
         Serial.println("[SCALE] ERROR: HX711 not detected. Continuing without it - WiFi/Firebase setup still runs.");
         display.showError("HX711 ERROR!", "Check wiring");
-        delay(1500);
+        delay(1000);
     }
     else
     {
         Serial.println("[SCALE] HX711 detected.");
     }
     loadCell.setCalibrationFactor(CALIBRATION_FACTOR);
+
+    // --------------------------------------------------------
+    // PHYSICAL WARM-UP TIMING START (see warmUpScale()'s own comment)
+    // --------------------------------------------------------
+
+    unsigned long warmupStartTime = millis();
+    Serial.print("[PERF] Boot HX711 ready: ");
+    Serial.print(warmupStartTime);
+    Serial.println("ms");
 
     // --------------------------------------------------------
     // LOCAL STORAGE
@@ -713,18 +913,18 @@ void setup()
     if (wifiOk)
     {
         display.showError("WiFi Connected!", network.getIPAddress());
-        delay(1500);
+        delay(500);
     }
     else if (network.isProvisioning())
     {
         Serial.println("[WIFI] Setup portal active - scale continues in offline/local mode.");
-        delay(1500); // Let showWifiSetupModeOnDisplay()'s message stay readable briefly.
+        delay(1000); // Let showWifiSetupModeOnDisplay()'s message stay readable briefly.
     }
     else
     {
         Serial.println("[WIFI] Offline mode — no Firebase upload.");
         display.showError("WiFi FAILED", "Offline mode");
-        delay(2000);
+        delay(1000);
     }
 
     // --------------------------------------------------------
@@ -738,21 +938,25 @@ void setup()
         if (firebase.begin())
         {
             display.showError("Firebase OK!", "");
-            delay(1000);
+            delay(400);
         }
         else
         {
             Serial.println("[FB] Firebase init failed.");
             display.showError("Firebase FAILED", "Check config");
-            delay(2000);
+            delay(1000);
         }
     }
 
     // --------------------------------------------------------
-    // WARM-UP (60 seconds, WARMUP_TIME_MS)
+    // WARM-UP (60 seconds of physical settling, minus whatever elapsed
+    // above since the HX711 finished initializing - see warmUpScale())
     // --------------------------------------------------------
 
-    warmUpScale();
+    warmUpScale(warmupStartTime);
+    Serial.print("[PERF] Physical warmup complete: ");
+    Serial.print(millis());
+    Serial.println("ms");
 
     // --------------------------------------------------------
     // TARE
@@ -778,7 +982,7 @@ void setup()
         // into every boot with a bad/absent load cell.
         Serial.println("[SCALE] ERROR: Unable to tare. Continuing without it - WiFi/Firebase and the setup portal stay up.");
         display.showError("Tare failed!", "Check HX711");
-        delay(1500);
+        delay(1000);
     }
     else
     {
@@ -803,7 +1007,12 @@ void setup()
     resetStabilityBuffer(0.0f);
 
     display.showReady();
-    delay(1500);
+    delay(500);
+
+    perfScaleReadyTime = millis();
+    Serial.print("[PERF] Scale ready: ");
+    Serial.print(perfScaleReadyTime);
+    Serial.println("ms");
 }
 
 // ============================================================
@@ -829,6 +1038,12 @@ void loop()
 
     network.update();
 
+    // Always non-blocking (see FirebaseManager::pollReconnect()'s own
+    // comment) - safe to call unconditionally every iteration, same as
+    // network.update() above. Advances any in-progress reconnect attempt
+    // one small step; a no-op the rest of the time.
+    firebase.pollReconnect();
+
     // --------------------------------------------------------
     // READING INTERVAL
     // --------------------------------------------------------
@@ -851,7 +1066,7 @@ void loop()
     if (!loadCell.readWeightGrams(READING_SAMPLES, sensorWeightGrams, HX711_TIMEOUT_MS))
     {
         Serial.println("[SCALE] ERROR: HX711 read timeout.");
-        display.showError("Read timeout!", "Check HX711");
+        showIfChanged("Read timeout!", "Check HX711");
         return;
     }
 
@@ -870,21 +1085,21 @@ void loop()
     if (isnan(sensorWeightGrams) || isinf(sensorWeightGrams))
     {
         Serial.println("[SCALE] ERROR: Corrupted reading (NaN/Inf).");
-        display.showError("Bad reading!", "");
+        showIfChanged("Bad reading!", "");
         return;
     }
 
     if (sensorWeightGrams > MAX_WEIGHT_GRAMS)
     {
         Serial.println("[SCALE] ERROR: Weight exceeds 20 kg.");
-        display.showError("OVERLOAD!", "Max: 20 kg");
+        showIfChanged("OVERLOAD!", "Max: 20 kg");
         return;
     }
 
     if (sensorWeightGrams < -1000.0f)
     {
         Serial.println("[SCALE] ERROR: Invalid negative reading.");
-        display.showError("Bad reading!", "");
+        showIfChanged("Bad reading!", "");
         return;
     }
 
@@ -1051,6 +1266,7 @@ void loop()
                 awaitingAutoZero       = true;
                 collectingZeroBaseline = false;
                 emptySettleStartTime   = millis();
+                perfRemovalDetectedTime = millis();
             }
             else
             {
@@ -1075,25 +1291,22 @@ void loop()
     // FIREBASE RECONNECT
     // --------------------------------------------------------
     //
-    // firebase.begin() only ever ran once, in setup() - retried here
-    // instead whenever WiFi is up but Firebase itself isn't ready yet,
-    // cooldown-gated to FIREBASE_RETRY_INTERVAL_MS so this never re-runs
-    // the multi-second NTP+auth sequence every reading cycle.
+    // Retried here, cooldown-gated to FIREBASE_RETRY_INTERVAL_MS, whenever
+    // WiFi is up but Firebase itself isn't ready yet. Non-blocking:
+    // startReconnect() below only ever KICKS OFF an attempt (never blocks);
+    // firebase.pollReconnect(), called unconditionally near the top of
+    // loop(), does the actual stepping, one small bounded check per call -
+    // see FirebaseManager's class comment for the full reasoning and for
+    // why a fresh HTTPS bootstrap is deliberately out of scope for this
+    // path (only setup()'s one-time firebase.begin() does that).
     //
-    // Gated on the platform being empty this cycle (filteredWeightGrams
-    // below UPLOAD_MIN_GRAMS): firebase.begin() performs NTP sync + a full
-    // TLS auth handshake and can legitimately block for several seconds to
-    // over ten. Running it while something is actively resting on the
-    // platform would starve HX711 sampling for that span - the stability
-    // buffer keeps advancing on wall-clock time (STABLE_HOLD_MS) without
-    // ever actually observing the object holding still, so the very next
-    // sample after the block could satisfy the hold timer immediately even
-    // though nothing was genuinely watched settle.
-    //
-    // Network reconnection itself (NetworkManager::pollReconnect(), via
-    // network.update() at the top of loop()) is NOT gated this way - it is
-    // genuinely non-blocking (see NetworkManager.cpp), so it's always safe
-    // to run regardless of weighing state.
+    // Still gated on the platform being empty this cycle, same as before -
+    // not because starting an attempt could block anything anymore, but to
+    // keep priority ordering simple: never kick off new network work while
+    // an active weighing is in progress. Network reconnection itself
+    // (NetworkManager::pollReconnect(), via network.update() at the top of
+    // loop()) has never needed this gate - it was already fully
+    // non-blocking (see NetworkManager.cpp).
     //
     // There is no queue-sync retry here anymore - offline measurements are
     // never persisted or retried (see the CAPTURE block below and
@@ -1105,10 +1318,7 @@ void loop()
         millis() - lastFirebaseRetryTime >= FIREBASE_RETRY_INTERVAL_MS)
     {
         lastFirebaseRetryTime = millis();
-        if (firebase.begin())
-        {
-            Serial.println("[FIREBASE] Authentication restored.");
-        }
+        firebase.startReconnect();
     }
 
     // --------------------------------------------------------
@@ -1130,6 +1340,16 @@ void loop()
 
     if (filteredWeightGrams >= UPLOAD_MIN_GRAMS)
     {
+        if (!loadActive)
+        {
+            // [PERF] Load detected: time since the scale last became
+            // available (boot's "Scale ready" or the last "Re-armed").
+            perfLoadDetectedTime = millis();
+            Serial.print("[PERF] Load detected: +");
+            Serial.print(perfLoadDetectedTime - perfScaleReadyTime);
+            Serial.println("ms");
+        }
+
         loadActive = true;
 
         if (!capturedThisLoad)
@@ -1211,11 +1431,11 @@ void loop()
 
     if (awaitingAutoZero)
     {
-        display.showError("ZEROING...", "Please wait");
+        showIfChanged("ZEROING...", "Please wait");
     }
     else if (platformEmpty)
     {
-        display.showError("READY", "Place harvest");
+        showIfChanged("READY", "Place harvest");
     }
     else if (!capturedThisLoad)
     {
@@ -1225,7 +1445,7 @@ void loop()
         // is still kept up to date here so the capture block below has the
         // right final value for the "SAVED"/"OFFLINE" message.
         displayWeightGrams = reportedGrams;
-        display.showError("WEIGHING...", "Hold still");
+        showIfChanged("WEIGHING...", "Hold still");
     }
 
     // --------------------------------------------------------
@@ -1235,17 +1455,19 @@ void loop()
     // Throttled — Firebase SSL calls are slow on ESP8266.
     // Calling every reading cycle would flood the board and cause crashes.
     //
-    // Frozen at the confirmed value once a load is locked in
-    // (capturedThisLoad), instead of continuing to overwrite it with
-    // ordinary raw-reading noise - the harvests/ entry is the source of
-    // truth once logged, so a live number that keeps wiggling next to an
-    // already-confirmed one reads as contradictory. Restack detection above
-    // re-opens this the instant enough extra weight is added to be a real
-    // new total rather than noise.
+    // Suspended for the ENTIRE active-weighing session (loadActive), not
+    // just after capture - HX711 sampling/stability timing takes priority
+    // over this nonessential telemetry, and a blocking RTDB write landing
+    // mid-stabilization could otherwise delay reaching STABLE_HOLD_MS. Also
+    // stays suspended through the post-removal re-zeroing window, since
+    // loadActive only clears once that finishes - nothing meaningful to
+    // report live during either window anyway. Does not touch the final
+    // confirmed-weight upload, which is a separate, unconditional call in
+    // the CAPTURE block below.
     //
 
     if (firebase.isReady() &&
-        !capturedThisLoad &&
+        !loadActive &&
         millis() - lastLiveUpdateTime >= 5000)
     {
         lastLiveUpdateTime = millis();
@@ -1271,6 +1493,10 @@ void loop()
                 Serial.print(reportedGrams, 1);
                 Serial.println(" g");
 
+                Serial.print("[PERF] Stable confirmed: +");
+                Serial.print(millis() - perfLoadDetectedTime);
+                Serial.println("ms");
+
                 // capturedAt: the physical measurement's own timestamp,
                 // set the moment it's confirmed - epoch seconds if the
                 // clock is synced, 0 if it genuinely isn't (never a faked
@@ -1290,10 +1516,26 @@ void loop()
                 // failure mode left to retry (nothing is written to flash
                 // for an offline result), and no later upload attempt for
                 // this measurement regardless of the outcome.
+                capturedThisLoad = true;
+                isStable         = false;
+
+                // P3: the physical result is locked in above - show it on
+                // the LCD immediately, BEFORE ever touching the network, so
+                // a slow or unreachable Firebase can never delay the
+                // user-visible weight. "SAVED" is never shown until Firebase
+                // actually confirms the write below; a definitely-offline
+                // result goes straight to the same "OFFLINE" wording this
+                // screen always used.
+                String weightLine = String(displayGrams(displayWeightGrams)) + " g";
+                bool   willAttemptUpload = network.isConnected() && firebase.isReady();
+
+                showIfChanged(willAttemptUpload ? "Saving..." : "OFFLINE", weightLine);
+
                 bool wasUploaded = false;
 
-                if (network.isConnected() && firebase.isReady())
+                if (willAttemptUpload)
                 {
+                    unsigned long uploadStart = millis();
                     String measurementId;
                     if (firebase.uploadMeasurement(reportedGrams, capturedAtEpoch, measurementId))
                     {
@@ -1301,21 +1543,24 @@ void loop()
                         Serial.print("[SCALE] Firebase measurement saved: ");
                         Serial.println(measurementId);
                     }
+                    Serial.print("[PERF] Firebase upload: ");
+                    Serial.print(millis() - uploadStart);
+                    Serial.println("ms");
                 }
-
-                capturedThisLoad = true;
-                isStable         = false;
 
                 if (wasUploaded)
                 {
-                    display.showError("SAVED", String(displayGrams(displayWeightGrams)) + " g");
+                    showIfChanged("SAVED", weightLine);
                 }
                 else
                 {
-                    Serial.print("[SCALE] Offline/local-only measurement: ");
-                    Serial.print(reportedGrams, 1);
-                    Serial.println(" g");
-                    display.showError("OFFLINE", String(displayGrams(displayWeightGrams)) + " g");
+                    if (!willAttemptUpload)
+                    {
+                        Serial.print("[SCALE] Offline/local-only measurement: ");
+                        Serial.print(reportedGrams, 1);
+                        Serial.println(" g");
+                    }
+                    showIfChanged("OFFLINE", weightLine);
                 }
                 delay(1500);
             }
