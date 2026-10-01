@@ -5,6 +5,7 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <DNSServer.h>
+#include <functional>
 
 // ============================================================
 // NETWORK MANAGER
@@ -49,6 +50,29 @@ public:
 
     bool isProvisioning() const;
 
+    // --------------------------------------------------------
+    // PENDING-MEASUREMENT PORTAL PAGE
+    // --------------------------------------------------------
+    //
+    // This class owns the only web server this device ever runs (the setup
+    // portal), but has no knowledge of FirebaseManager/the scale's own
+    // pending-measurement concept - loose coupling, same as
+    // onProvisioningStart above. The .ino registers these four small
+    // callbacks once, in setup(), so that WHENEVER the portal happens to be
+    // serving (not just during first-time setup - see pollReconnect()'s
+    // ~30s fallback-to-portal behavior), a person connected to it can see
+    // a stuck unsynced measurement and - as a deliberate, explicit action -
+    // discard it, rather than the scale being unusable for a new weighing
+    // with no recourse until connectivity happens to return. See
+    // FirebaseManager::discardPendingMeasurement()'s own comment for why
+    // this must stay a manual action, never automatic.
+    void setPendingMeasurementProvider(
+        std::function<bool()>   hasPending,
+        std::function<float()>  getGrams,
+        std::function<String()> getMeasurementId,
+        std::function<bool()>   discard
+    );
+
     void disconnect();
 
     bool isConnected() const;
@@ -80,9 +104,21 @@ private:
     String buildSetupFormHtml() const;
     String buildSetupSuccessHtml() const;
     String buildSetupFailureHtml() const;
+    String buildPendingViewHtml() const;
+    String buildPendingDiscardedHtml() const;
 
     bool loadCredentials(String& ssid, String& password);
     bool saveCredentials(const String& ssid, const String& password);
+
+    // Unset (empty std::function) until setPendingMeasurementProvider() is
+    // called - every route/page that uses these checks first, so a device
+    // whose .ino never registers them (shouldn't happen in practice, but
+    // cheap to guard) just omits the pending-measurement UI entirely rather
+    // than crashing on an empty std::function call.
+    std::function<bool()>   _hasPendingMeasurement;
+    std::function<float()>  _getPendingGrams;
+    std::function<String()> _getPendingMeasurementId;
+    std::function<bool()>   _discardPendingMeasurement;
 
     String _ssid;
     String _password;

@@ -130,6 +130,19 @@ bool NetworkManager::isProvisioning() const
     return _provisioning;
 }
 
+void NetworkManager::setPendingMeasurementProvider(
+    std::function<bool()>   hasPending,
+    std::function<float()>  getGrams,
+    std::function<String()> getMeasurementId,
+    std::function<bool()>   discard
+)
+{
+    _hasPendingMeasurement     = hasPending;
+    _getPendingGrams           = getGrams;
+    _getPendingMeasurementId   = getMeasurementId;
+    _discardPendingMeasurement = discard;
+}
+
 bool NetworkManager::attemptConnection()
 {
     Serial.println();
@@ -396,6 +409,32 @@ void NetworkManager::setupAPServer()
         _server.send(200, "application/json", "{\"status\":\"setup_mode\"}");
     });
 
+    // View-only - shows the stuck measurement (if any) so a person can see
+    // it before deciding whether to discard it. GET is safe/idempotent
+    // here on purpose: the actual destructive action lives on the POST
+    // route below, not here, so a browser prefetch or anything else that
+    // might issue a stray GET can never discard real data by accident.
+    _server.on("/pending", HTTP_GET, [this]() {
+        _server.send(200, "text/html", buildPendingViewHtml());
+    });
+
+    // The one and only way a pending measurement is ever discarded without
+    // actually syncing - see FirebaseManager::discardPendingMeasurement()'s
+    // comment for why this must stay a deliberate POST from a person
+    // looking at /pending, never automatic.
+    _server.on("/pending/discard", HTTP_POST, [this]() {
+        Serial.println("[AP HTTP] POST /pending/discard");
+
+        bool discarded = _discardPendingMeasurement ? _discardPendingMeasurement() : false;
+
+        if (!discarded)
+        {
+            Serial.println("[AP HTTP] Nothing pending to discard");
+        }
+
+        _server.send(200, "text/html", buildPendingDiscardedHtml());
+    });
+
     // Minimal captive-portal form, served at the root so a phone's
     // automatic captive-portal browser lands on something usable without
     // a companion app (this standalone device, unlike the ESP32 units,
@@ -459,6 +498,18 @@ String NetworkManager::pageShell(const String& bodyHtml) const
         "font-size:15px;font-weight:600}"
         "button:active{background:#0B3D33}"
         ".hint{margin-top:16px;font-size:12px;color:#2E4F46;text-align:center}"
+        // Pending-measurement banner on the main setup page, and the
+        // /pending view/discard page's own value display + danger action -
+        // same card chrome, distinct enough coloring to read as "something
+        // needs your attention" without a whole second visual language.
+        ".notice{background:#FFF6E0;border:1px solid #E8D9A8;border-radius:10px;"
+        "padding:12px 14px;margin-bottom:18px;font-size:13px;color:#5C4A12;line-height:1.4}"
+        ".notice a{color:#116F59;font-weight:600;text-decoration:none}"
+        ".weight{font-size:36px;font-weight:700;text-align:center;margin:4px 0 4px;color:#0B3D33}"
+        ".weight-id{font-size:12px;color:#2E4F46;text-align:center;margin-bottom:20px;word-break:break-all}"
+        ".btn-danger{background:#B3261E}"
+        ".btn-danger:active{background:#8C1D17}"
+        ".btn-secondary{background:#fff;color:#116F59;border:1px solid #D8E3E0;margin-top:10px}"
         "</style></head><body><div class=\"card\">"
         + bodyHtml +
         "</div></body></html>";
@@ -472,7 +523,19 @@ String NetworkManager::buildSetupFormHtml() const
     String body =
         "<div class=\"badge\">" + String(FPSTR(LOGO_SVG)) + "</div>"
         "<h1>Harvest Scale Setup</h1>"
-        "<p class=\"sub\">Enter the Wi-Fi network this scale should join.</p>"
+        "<p class=\"sub\">Enter the Wi-Fi network this scale should join.</p>";
+
+    // Surfaced here too, not just at /pending directly, so someone who
+    // lands on this page (the captive-portal default) actually notices a
+    // stuck measurement exists rather than needing to already know the URL.
+    if (_hasPendingMeasurement && _hasPendingMeasurement())
+    {
+        body +=
+            "<div class=\"notice\">A weighing is saved on this scale but hasn't reached "
+            "the server yet. <a href=\"/pending\">View it</a></div>";
+    }
+
+    body +=
         "<form method=\"POST\" action=\"/setup\">"
         "<label for=\"ssid\">Network name (SSID)</label>"
         "<input id=\"ssid\" name=\"ssid\" type=\"text\" maxlength=\"32\" autocapitalize=\"off\" autocorrect=\"off\" required>"
@@ -506,6 +569,57 @@ String NetworkManager::buildSetupFailureHtml() const
         "<p class=\"sub\">That network couldn't be reached. Double-check the name and password and try again "
         "- nothing was changed, and the scale is still weighing locally.</p>"
         "<a href=\"/\" style=\"display:block;text-align:center;color:#116F59;font-weight:600;text-decoration:none;margin-top:8px\">&larr; Try again</a>";
+
+    return pageShell(body);
+}
+
+// Shows whatever's actually staged on flash right now (via the provider
+// callbacks - see setPendingMeasurementProvider()), and offers the ONE
+// deliberate way to discard it without it ever syncing. Reachable any time
+// the setup portal happens to be serving, same as every other route here -
+// that includes the ~30s auto-fallback case (NetworkManager::pollReconnect()),
+// not just a from-scratch unprovisioned boot.
+String NetworkManager::buildPendingViewHtml() const
+{
+    bool hasPending = _hasPendingMeasurement && _hasPendingMeasurement();
+
+    if (!hasPending)
+    {
+        String body =
+            "<h1>Nothing Pending</h1>"
+            "<p class=\"sub\">There's no unsynced measurement waiting right now - either it "
+            "already synced, or nothing's been weighed yet.</p>"
+            "<a href=\"/\" style=\"display:block;text-align:center;color:#116F59;font-weight:600;text-decoration:none;margin-top:8px\">&larr; Back</a>";
+        return pageShell(body);
+    }
+
+    float  grams = _getPendingGrams ? _getPendingGrams() : 0.0f;
+    String id    = _getPendingMeasurementId ? _getPendingMeasurementId() : "";
+
+    String body =
+        "<h1>Pending Measurement</h1>"
+        "<p class=\"sub\">Captured on this scale, not yet saved to the server.</p>"
+        "<div class=\"weight\">" + String(grams, 1) + " g</div>"
+        "<div class=\"weight-id\">" + id + "</div>"
+        "<p class=\"sub\">This will sync automatically the moment the scale reconnects - "
+        "nothing is lost by waiting. Only discard it if you're sure you don't need this "
+        "weighing recorded.</p>"
+        "<form method=\"POST\" action=\"/pending/discard\">"
+        "<button type=\"submit\" class=\"btn-danger\">Discard This Measurement</button>"
+        "</form>"
+        "<a href=\"/\"><button type=\"button\" class=\"btn-secondary\">&larr; Back</button></a>";
+
+    return pageShell(body);
+}
+
+String NetworkManager::buildPendingDiscardedHtml() const
+{
+    String body =
+        "<div class=\"badge badge--check\">&#10003;</div>"
+        "<h1>Discarded</h1>"
+        "<p class=\"sub\">The pending measurement was removed. The scale is ready to weigh "
+        "the next item.</p>"
+        "<a href=\"/\" style=\"display:block;text-align:center;color:#116F59;font-weight:600;text-decoration:none;margin-top:8px\">&larr; Back</a>";
 
     return pageShell(body);
 }

@@ -28,47 +28,59 @@
 //
 //   devices/{deviceId}/harvestScale/
 //     liveWeight : float  ← live reading (overwrite every loop)
+//     lastSeen   : epoch seconds of the last liveWeight write - see
+//                  updateLiveWeight() below.
 //     harvests/
 //       {measurementId}/    ← child key IS the canonical measurementId,
 //                              generated the instant a measurement is
-//                              confirmed ONLINE (see "MEASUREMENT ID"
-//                              below) and written with setJSON() - never
-//                              pushJSON(). If this exact call is ever
-//                              retried within the same attempt (not
-//                              currently done, but the path itself stays
-//                              idempotent by design), it would overwrite
-//                              the same node rather than creating a
-//                              duplicate.
+//                              CAPTURED (staged to flash), regardless of
+//                              whether WiFi/Firebase happen to be available
+//                              at that moment - see "MEASUREMENT ID" below.
+//                              Written with setJSON() - never pushJSON() -
+//                              so every retry of the SAME measurement (an
+//                              immediate attempt that failed, or a later
+//                              one once connectivity returns) lands on the
+//                              exact same node instead of creating a
+//                              duplicate. Also stays the SAME node across a
+//                              RESTACK (weight added/removed on the same
+//                              physical session without a full clear - see
+//                              the .ino's RESTACK DETECTION) via
+//                              restagePendingMeasurement(): one record per
+//                              physical session, always overwritten to the
+//                              latest total, never two entries competing
+//                              for "the" current weight.
 //         grams      : float
 //         kg         : float
 //         capturedAt : epoch seconds when the physical measurement was
 //                      confirmed - 0 only when the scale's clock genuinely
-//                      wasn't synced yet at that exact moment. Never a
+//                      wasn't synced yet at capture time AND it couldn't be
+//                      safely reconstructed later either (see
+//                      syncPendingMeasurement() in the .cpp). Never a
 //                      fabricated value.
-//         syncedAt   : epoch seconds when this entry was written - always
-//                      essentially the same instant as capturedAt now,
-//                      since uploadMeasurement() only ever runs
-//                      synchronously at confirmation time (see below).
+//         syncedAt   : epoch seconds when this entry was actually WRITTEN
+//                      here - can be well after capturedAt if the device
+//                      was offline in between.
 //         uptimeMs   : device uptime (millis()) at capture, for diagnostics
+//         measurementId : the same value as the RTDB key itself, duplicated
+//                      into the record for convenience.
 //
-// ONLINE-ONLY UPLOAD (no offline queue) — a confirmed physical weighing is
-// EITHER uploaded to RTDB synchronously, right at the moment it's
-// confirmed (if WiFi is connected and Firebase is already authenticated),
-// OR simply displayed on the LCD as a local-only result and then
-// forgotten. There is deliberately no persistence layer, retry queue, or
-// later "catch up and upload" path for offline measurements - see
-// uploadMeasurement() below and the .ino's CAPTURE block for the full
-// capture-time decision. This is an intentional product decision: an
-// offline measurement is meant for manual entry in the Android app, and
-// must never later compete with a genuinely new online measurement by
-// silently appearing in Firebase after the fact.
+// CAPTURE ≠ UPLOAD, WITH RETRY — a confirmed physical weighing is persisted
+// to flash FIRST (stagePendingMeasurement()), before network availability
+// enters the picture at all, and is only cleared from flash once RTDB
+// actually confirms the write (syncPendingMeasurement()). One slot only:
+// this is a standalone single-platform scale, not a multi-item offline
+// queue - a second physical load cannot be captured while an earlier one
+// is still unsynced (see the .ino's CAPTURE block and STABILITY TRACKING
+// gate). An unsynced measurement survives indefinitely on flash, including
+// across a reboot, and is retried automatically every time Firebase is
+// ready - see the .ino's PENDING SYNC RETRY block.
 //
-// MEASUREMENT ID — generated only for an ONLINE upload attempt, the
-// instant that attempt is made: "HS_<chipId>_<sequence>", where chipId is
-// this unit's own ESP.getChipId() (fixed in silicon, needs no network) and
-// sequence is a monotonic counter persisted to flash independently of any
-// individual upload, so a gap (an attempt that then failed) is harmless
-// but a value is never reused.
+// MEASUREMENT ID — generated the instant a measurement is CAPTURED (staged
+// to flash), independent of network state: "HS_<chipId>_<sequence>", where
+// chipId is this unit's own ESP.getChipId() (fixed in silicon, needs no
+// network) and sequence is a monotonic counter persisted to flash
+// independently of any individual measurement, so a gap (a capture that
+// then failed to even persist) is harmless but a value is never reused.
 // ============================================================
 
 class FirebaseManager
@@ -110,42 +122,106 @@ public:
     // LOCAL STORAGE  (call once in setup(), BEFORE WiFi)
     // --------------------------------------------------------
     //
-    // Mounts LittleFS (needed for device-identity credentials and the
-    // measurement-sequence counter) and clears out any pending-measurement
-    // data left behind by an earlier firmware revision that supported
-    // offline sync - see clearLegacyPendingData() in the .cpp. Independent
-    // of WiFi/Firebase entirely. Idempotent: safe to call again (from
-    // begin() below, which also needs LittleFS) without remounting.
+    // Mounts LittleFS (needed for device-identity credentials, the
+    // measurement-sequence counter, and the pending-measurement record),
+    // recovers any pending measurement left over from a previous boot (see
+    // stagePendingMeasurement() below), and clears out the now-unused
+    // offline-QUEUE format an earlier firmware revision briefly used - see
+    // clearLegacyQueueData() in the .cpp. Independent of WiFi/Firebase
+    // entirely - a confirmed physical measurement must be persistable even
+    // on a unit that never reaches the internet at all. Idempotent: safe to
+    // call again (from begin() below, which also needs LittleFS) without
+    // remounting.
     bool beginLocalStorage();
 
     // --------------------------------------------------------
     // LIVE WEIGHT  (call every loop)
     // --------------------------------------------------------
 
-    // Overwrites devices/{deviceId}/harvestScale/liveWeight with the
-    // current reading. Fast set — no history, just current value.
+    // Updates devices/{deviceId}/harvestScale/liveWeight AND lastSeen
+    // (epoch seconds this write happened, or 0 if the clock isn't synced)
+    // together in one partial PATCH - no history, just current values,
+    // and harvests/ and every other sibling child is left untouched.
+    // lastSeen exists so a consumer can tell a genuinely live number apart
+    // from one that's just sitting there because this device went offline
+    // and can no longer push anything at all (this library has no RTDB
+    // onDisconnect() support to clear it server-side the instant that
+    // happens - checked, not available - so staleness has to be inferred
+    // from how old lastSeen is instead).
     bool updateLiveWeight(float grams);
 
     // --------------------------------------------------------
-    // ONLINE MEASUREMENT UPLOAD  (no offline persistence/retry - see header)
+    // PENDING MEASUREMENT  (capture ≠ upload, retried until synced)
     // --------------------------------------------------------
     //
-    // Call ONLY when the caller has already decided this measurement
-    // should be attempted online (i.e. after checking WiFi + isReady() -
-    // see the .ino's CAPTURE block). Generates a fresh, stable
-    // measurementId and writes ONE RTDB entry via setJSON() (never
-    // pushJSON()) to devices/{deviceId}/harvestScale/harvests/{measurementId}.
+    // A confirmed physical weighing is persisted to flash BEFORE it is
+    // considered "captured," and stays persisted until Firebase actually
+    // confirms the write - network availability must never determine
+    // whether the physical measurement exists. One slot only (see the
+    // header comment).
+
+    // Validates, generates a stable measurementId, persists everything to
+    // flash, and only THEN reports success - call this the instant a
+    // measurement is confirmed, regardless of WiFi/Firebase state. Refuses
+    // (returns false) if a measurement is already pending - the caller (the
+    // .ino) is expected to check hasPendingMeasurement() itself before even
+    // attempting a new capture, but this is the enforcement point that
+    // actually matters.
+    bool stagePendingMeasurement(float grams, uint32_t capturedAtEpochSec);
+
+    // RESTACK: updates an ALREADY-CAPTURED session's still-active weighing
+    // to a new total - weight added on top, or partially removed, while the
+    // same physical session is still ongoing (see the .ino's RESTACK
+    // DETECTION block). Deliberately reuses the EXACT SAME measurementId
+    // (passed in, not generated) rather than minting a new one: a restack
+    // is the SAME physical weighing becoming more current, not a second,
+    // competing one. This is what guarantees "whoever's most up to date
+    // wins" on the app side - there is only ever ONE RTDB record for this
+    // session, always overwritten in place via setJSON() in
+    // syncPendingMeasurement(), so the app can never be offered a stale
+    // intermediate total that's still sitting around unconsumed next to a
+    // newer one.
     //
-    // Synchronous: blocks for the duration of one RTDB write. This is a
-    // deliberate, bounded, one-shot call made exactly once at confirmation
-    // time - NOT a reconnect/reauthentication operation, and NOT retried
-    // by this class if it fails. On failure, returns false and the caller
-    // (the .ino) treats this measurement as a local-only "OFFLINE" result;
-    // nothing is queued or persisted for a later attempt.
-    //
-    // outMeasurementId is set only on success, for the caller's own log
-    // line.
-    bool uploadMeasurement(float grams, uint32_t capturedAtEpochSec, String& outMeasurementId);
+    // Refuses (returns false) if a DIFFERENT measurementId is currently
+    // pending - that would mean the .ino's own session bookkeeping is
+    // inconsistent with this class's state, and overwriting someone else's
+    // pending record would be a real bug, not a safe no-op. Also refuses on
+    // an empty measurementId. Same flash-persistence-first guarantee as
+    // stagePendingMeasurement(): only reports success once durably written.
+    bool restagePendingMeasurement(float grams, uint32_t capturedAtEpochSec, const String& measurementId);
+
+    bool hasPendingMeasurement() const;
+
+    // What's currently staged - for the LCD's "PENDING" screen and for
+    // reconstructing the same weight-line text once a later sync succeeds.
+    // Meaningless (returns 0 / empty) when hasPendingMeasurement() is false.
+    float  getPendingGrams() const;
+    String getPendingMeasurementId() const;
+
+    // Writes ONE RTDB entry, via setJSON() (never pushJSON()), to
+    // devices/{deviceId}/harvestScale/harvests/{measurementId} - the FIXED
+    // path this measurement's own stable id resolves to, so calling this
+    // again after an earlier failed/uncertain attempt overwrites the exact
+    // same node instead of creating a duplicate. Synchronous: blocks for the
+    // duration of one RTDB write - call only when isReady() (checked
+    // internally too). Clears the pending record ONLY once RTDB confirms
+    // the write succeeded; on any failure (including one where the write
+    // may have actually landed but the response was lost) the pending
+    // record is left untouched on flash for a later retry. No-op (returns
+    // false) if nothing is pending or Firebase isn't ready.
+    bool syncPendingMeasurement();
+
+    // Explicit, deliberate data loss - the ONLY other way a pending
+    // measurement ever leaves flash besides syncPendingMeasurement()
+    // actually confirming the write. For when connectivity genuinely isn't
+    // coming back (or the operator just wants the scale usable again right
+    // now) and someone has consciously decided this one physical weighing
+    // doesn't need to reach Firebase after all. Call sites must make this a
+    // deliberate user action (e.g. a confirm step on the setup portal page
+    // - see NetworkManager), never automatic/time-based - an unattended
+    // timeout silently discarding a real harvest would defeat the entire
+    // point of this class. No-op (returns false) if nothing is pending.
+    bool discardPendingMeasurement();
 
     // --------------------------------------------------------
     // NON-BLOCKING RECONNECT  (loop()-driven, refresh-token only)
@@ -219,21 +295,49 @@ private:
 
     bool _localStorageReady;
 
-    // One-time cleanup of pending-measurement data left behind by an
-    // earlier firmware revision (either the original single-pending-slot
-    // design or the later multi-measurement offline queue) - offline sync
-    // no longer exists, so nothing from either scheme may ever reach
-    // Firebase. Safe to call every boot: a no-op once nothing legacy is
-    // left on flash. See the .cpp for the exact filenames/paths involved.
-    void clearLegacyPendingData();
+    // Pending-measurement state, mirrored between RAM and small flat
+    // LittleFS files (same pattern already used for the auth credentials
+    // below) so hasPendingMeasurement()/getPendingGrams() are cheap enough
+    // to call every loop() cycle without touching flash each time.
+    bool     _hasPendingMeasurement;
+    float    _pendingGrams;
+    uint32_t _pendingCapturedAtEpoch;
+    uint32_t _pendingUptimeMs;
+    String   _pendingMeasurementId;
+
+    // True only while the currently-staged pending measurement was captured
+    // during THIS running process (a real stagePendingMeasurement() call,
+    // not one recovered from flash by loadPendingMeasurementFromDisk() at
+    // boot). This is what proves - not just assumes - that _pendingUptimeMs
+    // is directly comparable to millis() right now, which is what makes
+    // reconstructing capturedAt from elapsed uptime in
+    // syncPendingMeasurement() safe. Never persisted to flash: it must
+    // default to false on every fresh boot, and loadPendingMeasurementFromDisk()
+    // only ever runs once per boot (see beginLocalStorage()'s idempotency
+    // guard), so this is set correctly by construction, not by tracking
+    // reboots explicitly.
+    bool _pendingCapturedThisBoot;
+
+    void loadPendingMeasurementFromDisk();
+    void clearPendingMeasurementFile();
+
+    // One-time cleanup of the offline-QUEUE format a brief earlier firmware
+    // revision used (one file per queued measurement) - that specific
+    // multi-item-queue design is not what's being reintroduced here (this
+    // class still deliberately keeps the simpler single-pending-slot
+    // design), so any leftover queue files from that revision must not be
+    // mistaken for anything live. Safe to call every boot: a no-op once
+    // nothing legacy is left on flash. See the .cpp for the exact
+    // filenames/paths involved.
+    void clearLegacyQueueData();
 
     // Offline-safe, collision-free measurementId: "HS_<chipId>_<sequence>".
     // Advances (and durably persists) the sequence counter as its first
     // step, before this call can fail for any other reason - see the .cpp
     // for why a gap is acceptable here but reuse is not. Returns false (and
     // leaves outId untouched) only if the counter itself could not be
-    // durably advanced, in which case the caller must not attempt an
-    // upload at all rather than risk a reused/unstable id.
+    // durably advanced, in which case the caller must not stage a
+    // measurement at all rather than risk a reused/unstable id.
     bool generateMeasurementId(String& outId);
 
     // devices/{deviceId}/harvestScale — every RTDB path this class
